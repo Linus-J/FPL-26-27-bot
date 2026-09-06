@@ -182,8 +182,8 @@ def load_player_enrichment(season: str | None = None) -> pd.DataFrame:
     The dynamic fields (transfers/ownership → price_momentum, transfer_velocity)
     are read from the snapshot as-of the gameweek deadline, NOT the mutable
     players.* row broadcast onto every historical row (Phase-1 leak L3). The
-    set-piece role fields are per-(player, season) and safe. injury_severity and
-    press_sentiment are not point-in-time-recoverable historically → 0.
+    set-piece role fields are per-(player, season) and safe. injury_severity is
+    not point-in-time-recoverable historically → 0.
     """
     db = get_session()
     try:
@@ -201,8 +201,7 @@ def load_player_enrichment(season: str | None = None) -> pd.DataFrame:
                 0 AS injury_severity,
                 COALESCE(ps.transfers_in_event, 0) AS transfers_in_event,
                 COALESCE(ps.transfers_out_event, 0) AS transfers_out_event,
-                COALESCE(ps.selected_by_percent, 0.0) AS selected_by_percent_enrich,
-                0.0 AS press_sentiment
+                COALESCE(ps.selected_by_percent, 0.0) AS selected_by_percent_enrich
             FROM player_gw_stats s
             JOIN gameweeks g ON g.id = s.gameweek AND g.season = s.season
             LEFT JOIN player_state_snapshots ps ON ps.id = (
@@ -232,7 +231,7 @@ def load_player_enrichment(season: str | None = None) -> pd.DataFrame:
 def add_enrichment_features(df: pd.DataFrame, enrichment: pd.DataFrame) -> pd.DataFrame:
     dynamic = [
         "is_penalty_taker", "penalty_xg_per_game", "is_set_piece_taker",
-        "key_passes_per_game", "injury_severity", "press_sentiment",
+        "key_passes_per_game", "injury_severity",
         "price_momentum", "transfer_velocity",
     ]
     keys = ["player_id", "gameweek", "season"]
@@ -419,7 +418,6 @@ ENRICHMENT_FEATURE_COLS = [
     "is_set_piece_taker",
     "key_passes_per_game",
     "injury_severity",
-    "press_sentiment",
     "price_momentum",
     "transfer_velocity",
 ]

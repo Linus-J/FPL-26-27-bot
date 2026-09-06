@@ -350,9 +350,9 @@ def _fit_calibrated(base, X, y):
 def _degenerate_features(X: pd.DataFrame) -> dict[str, float]:
     """Features that are CONSTANT in the training data -> their one value.
 
-    Six of the eight enrichment features are identically zero across all five
+    Five of the seven enrichment features are identically zero across all five
     backfilled seasons (2026-08-17): is_penalty_taker, penalty_xg_per_game,
-    is_set_piece_taker, key_passes_per_game, injury_severity, press_sentiment.
+    is_set_piece_taker, key_passes_per_game, injury_severity.
     Their sources only exist for the season being played -- the depth chart is
     written per-season and the press scraper started in July 2026 -- so history
     has nothing to put in them.

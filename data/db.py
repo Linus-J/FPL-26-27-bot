@@ -122,6 +122,7 @@ def init_db() -> None:
     added = _add_missing_columns()
     _seed_data_checked_from_finished(added)
     _migrate_chip_comparison_unique()
+    _drop_player_press_signals()
 
 
 def _migrate_chip_comparison_unique() -> None:
@@ -157,6 +158,21 @@ def _migrate_chip_comparison_unique() -> None:
         migrate(engine)
     except Exception as exc:  # noqa: BLE001 -- a schema nicety never breaks a run
         logger.warning("chip_comparison_log migration skipped: %s", exc)
+
+
+def _drop_player_press_signals() -> None:
+    """Retire the Guardian press table on startup (2026-09-06).
+
+    Imported inside the function for the same reason as
+    ``_migrate_chip_comparison_unique``: a module-level import would bind the
+    name at import time and defeat monkeypatching in tests.
+    """
+    from data.migrations import drop_player_press_signals
+
+    try:
+        drop_player_press_signals(engine)
+    except Exception as exc:  # noqa: BLE001 -- startup must never die on cleanup
+        logger.warning("player_press_signals drop skipped: %s", exc)
 
 
 def get_session() -> Session:

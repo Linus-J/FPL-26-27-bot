@@ -84,15 +84,6 @@ def main() -> None:
     except Exception as exc:
         logging.getLogger().warning("Injury parser skipped: %s", exc)
 
-    # P3.8 (2026-08-16): press-conference signals are NOT ingested here any
-    # more. `player_press_signals` was written every run and read by nothing
-    # but the model definition -- a shadow layer that was never compared to
-    # anything, so it was pure weekly cost. The ingestor
-    # (data/ingestors/press_conference.py) and its table are kept intact;
-    # re-enable this once there is a way to measure whether the signal helps
-    # (the obvious route is a swept persona axis, so the cohort answers it
-    # before the real bot ever uses it -- see the recovery plan P3.8).
-
     decision = decision_engine.run(
         season=args.season,
         force_chip=force_chip,

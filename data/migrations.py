@@ -78,3 +78,24 @@ def migrate(engine: Engine) -> bool:
         conn.execute(text(f"ALTER TABLE {_TMP} RENAME TO chip_comparison_log"))
     logger.info("chip_comparison_log rebuilt with uq_chip_comparison")
     return True
+
+
+def drop_player_press_signals(engine: Engine) -> bool:
+    """Drop ``player_press_signals``, retired 2026-09-06.
+
+    The Guardian press-conference layer was unwired from the weekly run in
+    August 2026 (``scripts/run_agent.py``) and its one feature was already
+    neutralised by ``_pin_degenerate``, so the table has been written by
+    nothing and read by nothing since. ``create_all`` builds missing tables but
+    never drops a retired one, so without this a database that ran the agent
+    while the layer existed keeps a dead table indefinitely.
+
+    Idempotent, and safe on a database that never had the table.
+    Returns True when a table was actually dropped.
+    """
+    if "player_press_signals" not in inspect(engine).get_table_names():
+        return False
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE player_press_signals"))
+    logger.info("player_press_signals dropped (Guardian press layer retired)")
+    return True

@@ -286,13 +286,13 @@ def test_a_constant_feature_cannot_become_a_hidden_season_indicator():
 
     serve = pd.DataFrame({
         "real": [5.0, 6.0],
-        "press_sentiment": [-1.0, 1.0],   # populated live, absent in history
+        "injury_severity": [-1.0, 1.0],   # populated live, absent in history
     })
-    pinned = _pin_degenerate(serve, {"press_sentiment": 0.0})
+    pinned = _pin_degenerate(serve, {"injury_severity": 0.0})
 
-    assert list(pinned["press_sentiment"]) == [0.0, 0.0]
+    assert list(pinned["injury_severity"]) == [0.0, 0.0]
     assert list(pinned["real"]) == [5.0, 6.0], "real features must be untouched"
-    assert list(serve["press_sentiment"]) == [-1.0, 1.0], "must not mutate caller"
+    assert list(serve["injury_severity"]) == [-1.0, 1.0], "must not mutate caller"
 
 
 def test_pinning_is_a_no_op_when_nothing_is_degenerate():

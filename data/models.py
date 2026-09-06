@@ -8,7 +8,6 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
-    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -571,18 +570,6 @@ class PlayerSetPieceRole(Base):
     corner_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source: Mapped[str] = mapped_column(String, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class PlayerPressSignal(Base):
-    __tablename__ = "player_press_signals"
-    __table_args__ = (UniqueConstraint("player_id", "scraped_date", name="uq_press_player_date"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    player_id: Mapped[int] = mapped_column(Integer, ForeignKey("players.id"), nullable=False)
-    scraped_date: Mapped[str] = mapped_column(String(10), nullable=False)
-    sentiment: Mapped[float] = mapped_column(Float, default=0.0)
-    raw_quote: Mapped[str] = mapped_column(Text, default="")
-    source_url: Mapped[str] = mapped_column(String, default="")
 
 
 class PriorLeagueStats(Base):
