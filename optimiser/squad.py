@@ -128,6 +128,36 @@ def _semidev_by_id(df, mu: float) -> dict | None:
     return dict(zip(df["id"], df[col].fillna(0.0), strict=True))
 
 
+def _xi_objective(
+    selected: list,
+    starting: list,
+    captain: list,
+    vice: list,
+    scores: list[float],
+    cfg: OptimiserConfig,
+):
+    """The starting-XI half of the objective.
+
+    Factored out 2026-09-06. This expression was written twice — once for the
+    primary solve and once for the `max_transfers` fallback — and Task 2 is
+    about to give it per-week structure. `_bench_objective` was already shared
+    for exactly this reason; the XI half was missed.
+
+    `selected` is unused today and is taken anyway so the signature does not
+    have to change when a term needs it.
+    """
+    return pulp.lpSum(
+        scores[i] * (starting[i] + captain[i])
+        # The armband only passes to the vice when the captain does not
+        # feature, so it is worth P(captain blanks) x his score. Without this
+        # term `vice` is constrained but unvalued, every legal choice ties, and
+        # the solver returns whichever it branched on -- a goalkeeper, on the
+        # live frame, while a 7.43-xPts defender sat in the same XI.
+        + cfg.vice_captain_weight * scores[i] * vice[i]
+        for i in range(len(scores))
+    )
+
+
 def _bench_objective(
     prob: pulp.LpProblem,
     selected: list,
@@ -410,15 +440,8 @@ def optimise_squad(
     # own score — real insurance value against an unpredicted blank in the
     # XI — without letting bench quality compete with the starting XI for
     # budget on equal terms.
-    prob += pulp.lpSum(
-        scores[i] * (starting[i] + captain[i])
-        # The armband only passes to the vice when the captain does not
-        # feature, so it is worth P(captain blanks) x his score. Without this
-        # term `vice` is constrained but unvalued, every legal choice ties, and
-        # the solver returns whichever it branched on -- a goalkeeper, on the
-        # live frame, while a 7.43-xPts defender sat in the same XI.
-        + cfg.vice_captain_weight * scores[i] * vice[i]
-        for i in range(n)
+    prob += _xi_objective(
+        selected, starting, captain, vice, scores, cfg
     ) + _bench_objective(prob, selected, starting, scores, positions, cfg, "a")
 
     prob += pulp.lpSum(selected) == SQUAD.squad_size
@@ -467,10 +490,8 @@ def optimise_squad(
         starting2 = [pulp.LpVariable(f"sta2_{i}", cat="Binary") for i in range(n)]
         captain2 = [pulp.LpVariable(f"cap2_{i}", cat="Binary") for i in range(n)]
         vice2 = [pulp.LpVariable(f"vic2_{i}", cat="Binary") for i in range(n)]
-        prob2 += pulp.lpSum(
-            scores[i] * (starting2[i] + captain2[i])
-            + cfg.vice_captain_weight * scores[i] * vice2[i]
-            for i in range(n)
+        prob2 += _xi_objective(
+            selected2, starting2, captain2, vice2, scores, cfg
         ) + _bench_objective(prob2, selected2, starting2, scores, positions, cfg, "b")
         prob2 += pulp.lpSum(selected2) == SQUAD.squad_size
         prob2 += pulp.lpSum(costs[i] * selected2[i] for i in range(n)) <= budget
