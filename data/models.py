@@ -133,6 +133,46 @@ class Fixture(Base):
     odds: Mapped[list["FixtureOdds"]] = relationship("FixtureOdds", back_populates="fixture")
 
 
+class TeamMatch(Base):
+    """Every match a Premier League club played, in any competition
+    (2026-09-06).
+
+    Deliberately NOT rows in ``fixtures``. That table is keyed on FPL fixture
+    ids and carries ``team_h_id``/``team_a_id``/``gameweek``/FDR columns; a
+    City-Real Madrid tie has no FPL gameweek and one participant is not an FPL
+    team. Forcing European matches in would pollute the table
+    ``load_fixture_difficulty`` and ``_merge_on_fixture`` read on every
+    projection run, for no gain.
+
+    One row per (team, match) — so a single fixture between two PL clubs
+    produces TWO rows, one from each club's perspective. That is what makes
+    rest-day computation a simple per-team sort, and it is why
+    ``opponent_name`` is free text rather than a foreign key: European
+    opponents have no ``teams`` row and never will.
+
+    Holds historical Premier League matches too, so the rest-day computation
+    has exactly one implementation over exactly one table on both the training
+    and serving paths.
+    """
+
+    __tablename__ = "team_matches"
+    __table_args__ = (
+        UniqueConstraint(
+            "season", "team_id", "kickoff_time", name="uq_team_match"
+        ),
+        Index("ix_team_match_season_team", "season", "team_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    season: Mapped[str] = mapped_column(String(7), nullable=False)
+    team_id: Mapped[int] = mapped_column(Integer, ForeignKey("teams.id"), nullable=False)
+    kickoff_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # "PL" | "UCL" | "UEL" | "UECL" — see data.ingestors.leagues.COMPETITIONS
+    competition: Mapped[str] = mapped_column(String(8), nullable=False)
+    opponent_name: Mapped[str] = mapped_column(String, default="")
+    is_home: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class Gameweek(Base):
     __tablename__ = "gameweeks"
 
