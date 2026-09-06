@@ -11,6 +11,15 @@ from optimiser.scoring import lambda_mu_for_risk_level, risk_adjusted_score
 
 logger = logging.getLogger(__name__)
 
+# Per-week XI variables multiply the binary count by the horizon, so an
+# unbounded solve is no longer a safe default (2026-09-06). CBC returns its
+# incumbent on timeout and PuLP reports the status as `Not Solved`; every
+# solve below already treats a non-`Optimal` status as a fallback trigger, so
+# a timeout needs no branch of its own. `transfers.py` declares a
+# `solver_time_limit` parameter but no caller passes one, so it is not the
+# working precedent it looks like.
+SOLVER_TIME_LIMIT_SECONDS = 120
+
 POSITIONS = ("GKP", "DEF", "MID", "FWD")
 
 SQUAD_COUNTS = {
@@ -128,42 +137,110 @@ def _semidev_by_id(df, mu: float) -> dict | None:
     return dict(zip(df["id"], df[col].fillna(0.0), strict=True))
 
 
+def _per_week_scores(
+    projections: pd.DataFrame,
+    player_ids: list[int],
+    horizon: int,
+    decay: float,
+    cfg: OptimiserConfig,
+    eo_by_pid: dict[int, float],
+) -> dict[tuple[int, int], float]:
+    """Risk-adjusted score per (player_id, week index), decayed by ``decay ** w``.
+
+    Deliberately the same shape as ``transfers.py``'s ``scores_pw``. Until
+    2026-09-06 this function's job was done by ``_multi_gw_xpts``, which summed
+    the horizon into ONE number per player before the ILP ever saw it — so the
+    solver could not tell a player who is excellent in week 1 and useless in
+    week 3 from one who is mediocre in both. That is fine for deciding who to
+    own and wrong for deciding who to start.
+
+    Each week's inputs are grouped and summed exactly the way ``_multi_gw_xpts``
+    and friends aggregate the whole horizon — an absent player or an absent
+    column reading 0.0, a NaN reading as the group sum does. That is what makes
+    ``horizon == 1`` reproduce the collapsed coefficient to the last bit.
+    ``risk_adjusted_score`` is linear in both points and the risk term, so the
+    per-week decayed scores also still sum to the collapsed one at any horizon
+    whenever the XI does not move — the reformulation adds freedom, it does not
+    re-weight anything.
+    """
+    lam, mu = lambda_mu_for_risk_level(
+        cfg.risk_level, cfg.max_ownership_differential, cfg.mu_baseline, cfg.mu_range
+    )
+    gws = sorted(projections["gameweek"].unique())[:horizon]
+    # An empty projection frame still has to produce a solvable model, which is
+    # what it produced before: one week, every coefficient zero.
+    weeks = max(1, len(gws))
+    scores = {(pid, w): 0.0 for pid in player_ids for w in range(weeks)}
+
+    def _summed(gw_df: pd.DataFrame, col: str) -> pd.Series | None:
+        return gw_df.groupby("player_id")[col].sum() if col in gw_df.columns else None
+
+    def _at(series: pd.Series | None, pid: int) -> float:
+        return float(series.get(pid, 0.0)) if series is not None else 0.0
+
+    for w, gw in enumerate(gws):
+        gw_df = projections[projections["gameweek"] == gw]
+        xpts = _summed(gw_df, "xpts")
+        var = _summed(gw_df, "xpts_var")
+        # Absent semi-deviation columns read as 0.0 rather than None, so the
+        # risk term does NOT silently fall back to `xpts_var` — the same choice
+        # `optimise_squad` has documented since 2026-08-18, and the reason `mu`
+        # is inert rather than mis-scaled on frames that carry no semi-deviations.
+        up = _summed(gw_df, "upside")
+        down = _summed(gw_df, "downside")
+        for pid in player_ids:
+            scores[(pid, w)] = (decay ** w) * risk_adjusted_score(
+                _at(xpts, pid), _at(var, pid), eo_by_pid.get(pid, 0.0), lam, mu,
+                _at(up, pid), _at(down, pid),
+            )
+    return scores
+
+
 def _xi_objective(
     selected: list,
-    starting: list,
-    captain: list,
-    vice: list,
-    scores: list[float],
+    starting: dict,
+    captain: dict,
+    vice: dict,
+    scores_pw: dict,
+    player_ids: list[int],
+    weeks: int,
     cfg: OptimiserConfig,
 ):
-    """The starting-XI half of the objective.
+    """The starting-XI half of the objective, summed over every week.
 
     Factored out 2026-09-06. This expression was written twice — once for the
-    primary solve and once for the `max_transfers` fallback — and Task 2 is
-    about to give it per-week structure. `_bench_objective` was already shared
+    primary solve and once for the `max_transfers` fallback — and per-week
+    structure landed on it the same day. `_bench_objective` was already shared
     for exactly this reason; the XI half was missed.
+
+    `starting`/`captain`/`vice` are keyed (index, week). At `weeks == 1` this is
+    arithmetically identical to the previous single-week form, which is what the
+    H=1 equivalence test pins.
 
     `selected` is unused today and is taken anyway so the signature does not
     have to change when a term needs it.
     """
     return pulp.lpSum(
-        scores[i] * (starting[i] + captain[i])
+        scores_pw[(player_ids[i], w)] * (starting[(i, w)] + captain[(i, w)])
         # The armband only passes to the vice when the captain does not
         # feature, so it is worth P(captain blanks) x his score. Without this
         # term `vice` is constrained but unvalued, every legal choice ties, and
         # the solver returns whichever it branched on -- a goalkeeper, on the
         # live frame, while a 7.43-xPts defender sat in the same XI.
-        + cfg.vice_captain_weight * scores[i] * vice[i]
-        for i in range(len(scores))
+        + cfg.vice_captain_weight * scores_pw[(player_ids[i], w)] * vice[(i, w)]
+        for i in range(len(player_ids))
+        for w in range(weeks)
     )
 
 
 def _bench_objective(
     prob: pulp.LpProblem,
     selected: list,
-    starting: list,
-    scores: list[float],
+    starting: dict,
+    scores_pw: dict,
+    player_ids: list[int],
     positions: list[str],
+    weeks: int,
     cfg: OptimiserConfig,
     tag: str,
 ):
@@ -176,6 +253,11 @@ def _bench_objective(
     weight underpays the slot that gets used and overpays the two that do not,
     which is what buys four £4.0m non-players instead of one real substitute.
 
+    Per-week since 2026-09-06, alongside the XI: the squad is fixed across the
+    horizon but who sits on the bench is not, so `selected[i] - starting[(i, w)]`
+    is the week-`w` bench indicator and the slot assignment is made afresh each
+    week.
+
     Adds the slot-assignment constraints to ``prob`` and returns the terms to
     add to the objective. Slot weights are strictly decreasing, so the solver
     puts its best bench player in slot 1 without needing an ordering
@@ -183,27 +265,37 @@ def _bench_objective(
     """
     weights = [w * cfg.bench_value_weight for w in cfg.bench_slot_weights]
     gk_weight = cfg.bench_gk_weight * cfg.bench_value_weight
-    n = len(scores)
+    n = len(player_ids)
     outfield = [i for i in range(n) if positions[i] != "GKP"]
     keepers = [i for i in range(n) if positions[i] == "GKP"]
 
     slot = {
-        (i, k): pulp.LpVariable(f"bench_{tag}_{i}_{k}", cat="Binary")
+        (i, k, w): pulp.LpVariable(f"bench_{tag}_{i}_{k}_{w}", cat="Binary")
         for i in outfield
         for k in range(len(weights))
+        for w in range(weeks)
     }
-    for i in outfield:
-        prob += pulp.lpSum(slot[i, k] for k in range(len(weights))) == selected[i] - starting[i]
-    for k in range(len(weights)):
-        prob += pulp.lpSum(slot[i, k] for i in outfield) == 1
+    for w in range(weeks):
+        for i in outfield:
+            prob += (
+                pulp.lpSum(slot[i, k, w] for k in range(len(weights)))
+                == selected[i] - starting[(i, w)]
+            )
+        for k in range(len(weights)):
+            prob += pulp.lpSum(slot[i, k, w] for i in outfield) == 1
 
     terms = pulp.lpSum(
-        weights[k] * scores[i] * slot[i, k] for i in outfield for k in range(len(weights))
+        weights[k] * scores_pw[(player_ids[i], w)] * slot[i, k, w]
+        for i in outfield
+        for k in range(len(weights))
+        for w in range(weeks)
     )
     # The reserve keeper has no queue to inherit from: he plays only if the
     # first-choice keeper does not.
     terms += pulp.lpSum(
-        gk_weight * scores[i] * (selected[i] - starting[i]) for i in keepers
+        gk_weight * scores_pw[(player_ids[i], w)] * (selected[i] - starting[(i, w)])
+        for i in keepers
+        for w in range(weeks)
     )
     return terms
 
@@ -355,6 +447,14 @@ def optimise_squad(
     optimiser under a different risk posture per persona. ``None`` (every
     real-bot call site) is byte-for-byte identical to reading the global
     directly, as before this parameter existed."""
+    # The XI is chosen ONCE PER GAMEWEEK in the horizon (2026-09-06); only
+    # week 0's is reported, because week 0 is the one being locked in. The
+    # squad itself is a single horizon-wide choice, so the later weeks exist
+    # to price what the fifteen will be able to DO, not to plan transfers.
+    # Before this, the horizon was collapsed to one number per player and one
+    # XI covering all of it, so two players whose good fixtures alternate
+    # earned nothing for alternating — the exact case a wildcard or a cold
+    # start is deciding. ``optimiser/transfers.py`` never had this defect.
     cfg = config or OPTIMISER
     horizon = horizon or cfg.transfer_planning_horizon_gws
     force_include_ids = set(force_include_ids or [])
@@ -363,11 +463,18 @@ def optimise_squad(
     target_gw = horizon_gws[0] if horizon_gws else None
 
     # Two aggregates over the same horizon (2026-08-18): the TRUE sum, which
-    # is what gets reported, and the decayed sum, which is what gets optimised.
-    # See _decay_weights — a projection five gameweeks out is not worth as much
-    # as one for the match about to kick off, and every serious FPL optimiser
-    # discounts it. Reporting the decayed figure as "expected points" would be
-    # a lie about the quantity being predicted.
+    # is what gets reported, and the decayed sum. See _decay_weights — a
+    # projection five gameweeks out is not worth as much as one for the match
+    # about to kick off, and every serious FPL optimiser discounts it.
+    # Reporting the decayed figure as "expected points" would be a lie about
+    # the quantity being predicted.
+    #
+    # The ILP itself reads neither of these any more (2026-09-06): its
+    # coefficients come from `_per_week_scores`, which applies the same decay
+    # week by week instead of summing it away first. The decayed collapse
+    # survives here because the scenario-based captain pick below ranks on it,
+    # and it must keep answering the same question the solver's own captain
+    # variable does.
     decay = cfg.gameweek_decay
     xpts_by_player = _multi_gw_xpts(projections, horizon)
     xpts_for_objective = _multi_gw_xpts(projections, horizon, decay)
@@ -402,6 +509,10 @@ def optimise_squad(
         df["eo_pct"] = df["id"].map(eo_map).fillna(0.0)
     else:
         df["eo_pct"] = 0.0
+    # Reporting only since 2026-09-06: the horizon-collapsed coefficient the
+    # ILP used to optimise on. The solve now reads `_per_week_scores` instead,
+    # and this column survives because it is what the returned squad frame has
+    # always carried and what the scenario-based captain pick below ranks on.
     df["effective_score"] = [
         risk_adjusted_score(x, v, e, lam, mu, up, down)
         for x, v, e, up, down in zip(
@@ -418,19 +529,34 @@ def optimise_squad(
     player_ids = df["id"].tolist()
     idx = {pid: i for i, pid in enumerate(player_ids)}
     n = len(player_ids)
+    # One decision week per gameweek in the horizon. The squad is fixed across
+    # all of them; only the XI moves. `max(1, ...)` keeps an empty projection
+    # frame solvable, as the collapsed form was.
+    weeks = max(1, len(horizon_gws))
+
+    costs = df["now_cost"].tolist()
+    positions = df["position"].tolist()
+    teams = df["team_id"].tolist()
+    eo_by_pid = dict(zip(player_ids, df["eo_pct"], strict=True))
+    # P3-3 risk-adjusted, now per (player, week); true xpts_total for reporting
+    # is read straight off `df`/`starting_xi`.
+    scores_pw = _per_week_scores(projections, player_ids, horizon, decay, cfg, eo_by_pid)
 
     prob = pulp.LpProblem("fpl_squad", pulp.LpMaximize)
 
     selected = [pulp.LpVariable(f"sel_{i}", cat="Binary") for i in range(n)]
-    starting = [pulp.LpVariable(f"sta_{i}", cat="Binary") for i in range(n)]
-    captain = [pulp.LpVariable(f"cap_{i}", cat="Binary") for i in range(n)]
-    vice = [pulp.LpVariable(f"vic_{i}", cat="Binary") for i in range(n)]
-
-    scores = df["effective_score"].tolist()   # P3-3 risk-adjusted (objective);
-    # true xpts_total for reporting is read straight off `df`/`starting_xi`
-    costs = df["now_cost"].tolist()
-    positions = df["position"].tolist()
-    teams = df["team_id"].tolist()
+    starting = {
+        (i, w): pulp.LpVariable(f"sta_{i}_{w}", cat="Binary")
+        for i in range(n) for w in range(weeks)
+    }
+    captain = {
+        (i, w): pulp.LpVariable(f"cap_{i}_{w}", cat="Binary")
+        for i in range(n) for w in range(weeks)
+    }
+    vice = {
+        (i, w): pulp.LpVariable(f"vic_{i}_{w}", cat="Binary")
+        for i in range(n) for w in range(weeks)
+    }
 
     # 2026-07-30: a bench player used to contribute nothing to the objective
     # (only starting[i]/captain[i] did), so the solver had no reason to pick
@@ -441,31 +567,41 @@ def optimise_squad(
     # XI — without letting bench quality compete with the starting XI for
     # budget on equal terms.
     prob += _xi_objective(
-        selected, starting, captain, vice, scores, cfg
-    ) + _bench_objective(prob, selected, starting, scores, positions, cfg, "a")
+        selected, starting, captain, vice, scores_pw, player_ids, weeks, cfg
+    ) + _bench_objective(
+        prob, selected, starting, scores_pw, player_ids, positions, weeks, cfg, "a"
+    )
 
+    # Squad-level constraints. These stay on the single horizon-wide
+    # `selected` — you own one fifteen for the whole plan, and duplicating
+    # these per week would let the solver imagine a squad that changes shape
+    # between gameweeks without a transfer.
     prob += pulp.lpSum(selected) == SQUAD.squad_size
     prob += pulp.lpSum(costs[i] * selected[i] for i in range(n)) <= budget
-    prob += pulp.lpSum(starting) == 11
-    prob += pulp.lpSum(captain) == 1
-    prob += pulp.lpSum(vice) == 1
 
     for pos in POSITIONS:
         pos_idx = [i for i, p in enumerate(positions) if p == pos]
         prob += pulp.lpSum(selected[i] for i in pos_idx) == SQUAD_COUNTS[pos]
-        prob += pulp.lpSum(starting[i] for i in pos_idx) >= STARTING_MIN[pos]
-        prob += pulp.lpSum(starting[i] for i in pos_idx) <= STARTING_MAX[pos]
 
     team_ids = list(set(teams))
     for tid in team_ids:
         team_idx = [i for i, t in enumerate(teams) if t == tid]
         prob += pulp.lpSum(selected[i] for i in team_idx) <= SQUAD.max_players_per_club
 
-    for i in range(n):
-        prob += starting[i] <= selected[i]
-        prob += captain[i] <= starting[i]
-        prob += vice[i] <= starting[i]
-        prob += captain[i] + vice[i] <= 1
+    # XI-shape constraints, one copy per week.
+    for w in range(weeks):
+        prob += pulp.lpSum(starting[(i, w)] for i in range(n)) == 11
+        prob += pulp.lpSum(captain[(i, w)] for i in range(n)) == 1
+        prob += pulp.lpSum(vice[(i, w)] for i in range(n)) == 1
+        for pos in POSITIONS:
+            pos_idx = [i for i, p in enumerate(positions) if p == pos]
+            prob += pulp.lpSum(starting[(i, w)] for i in pos_idx) >= STARTING_MIN[pos]
+            prob += pulp.lpSum(starting[(i, w)] for i in pos_idx) <= STARTING_MAX[pos]
+        for i in range(n):
+            prob += starting[(i, w)] <= selected[i]
+            prob += captain[(i, w)] <= starting[(i, w)]
+            prob += vice[(i, w)] <= starting[(i, w)]
+            prob += captain[(i, w)] + vice[(i, w)] <= 1
 
     for pid in force_include_ids:
         if pid in idx:
@@ -482,40 +618,54 @@ def optimise_squad(
                 prob += new_player[i] == selected[i]
         prob += pulp.lpSum(new_player) <= max_transfers
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_SECONDS))
 
     if pulp.LpStatus[prob.status] != "Optimal" and current_squad_ids and max_transfers is not None:
         prob2 = pulp.LpProblem("fpl_squad_fallback", pulp.LpMaximize)
         selected2 = [pulp.LpVariable(f"sel2_{i}", cat="Binary") for i in range(n)]
-        starting2 = [pulp.LpVariable(f"sta2_{i}", cat="Binary") for i in range(n)]
-        captain2 = [pulp.LpVariable(f"cap2_{i}", cat="Binary") for i in range(n)]
-        vice2 = [pulp.LpVariable(f"vic2_{i}", cat="Binary") for i in range(n)]
+        starting2 = {
+            (i, w): pulp.LpVariable(f"sta2_{i}_{w}", cat="Binary")
+            for i in range(n) for w in range(weeks)
+        }
+        captain2 = {
+            (i, w): pulp.LpVariable(f"cap2_{i}_{w}", cat="Binary")
+            for i in range(n) for w in range(weeks)
+        }
+        vice2 = {
+            (i, w): pulp.LpVariable(f"vic2_{i}_{w}", cat="Binary")
+            for i in range(n) for w in range(weeks)
+        }
         prob2 += _xi_objective(
-            selected2, starting2, captain2, vice2, scores, cfg
-        ) + _bench_objective(prob2, selected2, starting2, scores, positions, cfg, "b")
+            selected2, starting2, captain2, vice2, scores_pw, player_ids, weeks, cfg
+        ) + _bench_objective(
+            prob2, selected2, starting2, scores_pw, player_ids, positions, weeks, cfg, "b"
+        )
         prob2 += pulp.lpSum(selected2) == SQUAD.squad_size
         prob2 += pulp.lpSum(costs[i] * selected2[i] for i in range(n)) <= budget
-        prob2 += pulp.lpSum(starting2) == 11
-        prob2 += pulp.lpSum(captain2) == 1
-        prob2 += pulp.lpSum(vice2) == 1
         for pos in POSITIONS:
             pos_idx = [i for i, p in enumerate(positions) if p == pos]
             prob2 += pulp.lpSum(selected2[i] for i in pos_idx) == SQUAD_COUNTS[pos]
-            prob2 += pulp.lpSum(starting2[i] for i in pos_idx) >= STARTING_MIN[pos]
-            prob2 += pulp.lpSum(starting2[i] for i in pos_idx) <= STARTING_MAX[pos]
         for tid in list(set(teams)):
             team_idx = [i for i, t in enumerate(teams) if t == tid]
             prob2 += pulp.lpSum(selected2[i] for i in team_idx) <= SQUAD.max_players_per_club
-        for i in range(n):
-            prob2 += starting2[i] <= selected2[i]
-            prob2 += captain2[i] <= starting2[i]
-            prob2 += vice2[i] <= starting2[i]
-            prob2 += captain2[i] + vice2[i] <= 1
+        for w in range(weeks):
+            prob2 += pulp.lpSum(starting2[(i, w)] for i in range(n)) == 11
+            prob2 += pulp.lpSum(captain2[(i, w)] for i in range(n)) == 1
+            prob2 += pulp.lpSum(vice2[(i, w)] for i in range(n)) == 1
+            for pos in POSITIONS:
+                pos_idx = [i for i, p in enumerate(positions) if p == pos]
+                prob2 += pulp.lpSum(starting2[(i, w)] for i in pos_idx) >= STARTING_MIN[pos]
+                prob2 += pulp.lpSum(starting2[(i, w)] for i in pos_idx) <= STARTING_MAX[pos]
+            for i in range(n):
+                prob2 += starting2[(i, w)] <= selected2[i]
+                prob2 += captain2[(i, w)] <= starting2[(i, w)]
+                prob2 += vice2[(i, w)] <= starting2[(i, w)]
+                prob2 += captain2[(i, w)] + vice2[(i, w)] <= 1
         for pid in force_include_ids:
             if pid in idx:
                 prob2 += selected2[idx[pid]] == 1
         _add_no_good_cuts(prob2, selected2, idx, forbidden_squads)
-        prob2.solve(pulp.PULP_CBC_CMD(msg=False))
+        prob2.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_SECONDS))
         if pulp.LpStatus[prob2.status] == "Optimal":
             logger.warning(
                 "max_transfers=%d infeasible; falling back to unconstrained squad",
@@ -532,10 +682,14 @@ def optimise_squad(
             f"ILP solver did not find optimal solution: {pulp.LpStatus[prob.status]}"
         )
 
+    # Week 0 is what gets reported. `starting_xi`, `captain_id` and
+    # `vice_captain_id` describe the gameweek about to be locked in — the only
+    # one any caller can act on — and every later week exists so that the
+    # squad is chosen knowing what it will be able to do with them.
     selected_ids = {player_ids[i] for i in range(n) if pulp.value(selected[i]) > 0.5}
-    starting_ids = {player_ids[i] for i in range(n) if pulp.value(starting[i]) > 0.5}
-    captain_id = next(player_ids[i] for i in range(n) if pulp.value(captain[i]) > 0.5)
-    vice_id = next(player_ids[i] for i in range(n) if pulp.value(vice[i]) > 0.5)
+    starting_ids = {player_ids[i] for i in range(n) if pulp.value(starting[(i, 0)]) > 0.5}
+    captain_id = next(player_ids[i] for i in range(n) if pulp.value(captain[(i, 0)]) > 0.5)
+    vice_id = next(player_ids[i] for i in range(n) if pulp.value(vice[(i, 0)]) > 0.5)
 
     if season is not None and target_gw is not None:
         # The decayed figure, matching the ILP's own captain variable, which
@@ -711,7 +865,7 @@ def optimise_starting_xi(
         prob += vice[i] <= starting[i]
         prob += captain[i] + vice[i] <= 1
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_SECONDS))
 
     if pulp.LpStatus[prob.status] != "Optimal":
         raise RuntimeError(f"Starting XI solver failed: {pulp.LpStatus[prob.status]}")
