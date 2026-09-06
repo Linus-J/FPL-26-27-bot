@@ -14,11 +14,10 @@
     "is_penalty_taker",
     "is_set_piece_taker",
     "key_passes_per_game",
-    "penalty_xg_per_game",
-    "press_sentiment"
+    "penalty_xg_per_game"
   ],
   "gws_left_this_half": 19,
-  "n_features": 37,
+  "n_features": 36,
   "squad": [
     "Anderson",
     "B.Fernandes",
