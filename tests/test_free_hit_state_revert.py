@@ -143,3 +143,34 @@ def test_the_newest_row_still_supplies_bank_and_free_transfers():
     assert state.squad_ids == [1, 2, 3]
     assert state.bank == 4.4
     assert state.free_transfers == 2
+
+
+def test_a_heavily_rerun_free_hit_week_does_not_push_the_real_squad_out_of_the_window():
+    """The read window was 50 ROWS, and the walk-back needs GAMEWEEKS.
+
+    A gameweek is decided many times -- GW3 of 2026-27 already has 17 lineup
+    rows -- so enough re-runs of a Free Hit week alone evict the previous
+    gameweek from the window entirely. The walk-back then finds no non-Free-Hit
+    gameweek, squad_ids comes back EMPTY, and decision_engine treats an empty
+    squad as a cold start: budget 100.0 and 15 free transfers, mid-season,
+    silently rebuilding the entire squad.
+    """
+    _log_lineup(2, [1, 2, 3], chip=None)
+    for _ in range(55):
+        _log_lineup(3, [90, 91, 92], chip="freehit")
+
+    assert _state(4).squad_ids == [1, 2, 3]
+
+
+def test_a_window_holding_only_free_hits_says_so_instead_of_failing_quietly(caplog):
+    """An empty squad_ids is read by the caller as a cold start -- 100.0 budget,
+    15 free transfers, the whole squad rebuilt. Mid-season that is the worst
+    outcome this function can produce, so it must not be silent."""
+    import logging
+
+    _log_lineup(2, [1, 2, 3], chip="freehit")
+    with caplog.at_level(logging.ERROR, logger="agent.decision_engine"):
+        assert _state(3).squad_ids == []
+    assert any("no owned squad could be recovered" in r.getMessage().lower()
+               or "cold start" in r.getMessage().lower()
+               for r in caplog.records if r.levelno >= logging.ERROR)

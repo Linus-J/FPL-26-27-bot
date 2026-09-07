@@ -92,6 +92,14 @@ class SquadState:
     purchase_prices: dict[int, float]
 
 
+# How many GAMEWEEKS of lineup history `_load_squad_state` reads. The walk-back
+# needs to step back past at most a run of consecutive Free Hit weeks, and
+# there are two Free Hits in a season, so this is generous by an order of
+# magnitude. Counted in gameweeks rather than rows because a gameweek is
+# decided many times over -- see the query.
+_SQUAD_STATE_WINDOW_GWS = 10
+
+
 def _load_squad_state(
     sim_manager_id: int | None,
     team_id: int,
@@ -126,28 +134,48 @@ def _load_squad_state(
     db = get_session()
     try:
         if sim_manager_id is not None:
-            # 50 rows is far more than the walk-back can ever need -- there
-            # are at most two Free Hits in a season -- while still bounding
-            # the read.
+            # Bounded by GAMEWEEKS, not rows (2026-09-07). The walk-back below
+            # steps back over gameweeks, so a row limit is the wrong unit: a
+            # gameweek is decided many times -- GW3 of 2026-27 already has 17
+            # lineup rows -- and enough re-runs of a single Free Hit week evict
+            # the previous gameweek from the window entirely. squad_ids then
+            # comes back EMPTY and the engine reads that as a cold start,
+            # silently rebuilding the whole squad on 100.0 budget and 15 free
+            # transfers, mid-season.
             query = text("""
                 SELECT gameweek, details FROM sim_decision_log
                 WHERE sim_manager_id = :sim_manager_id AND decision_type = 'lineup'
                   AND (:decided_gw IS NULL OR gameweek < :decided_gw)
-                ORDER BY created_at DESC LIMIT 50
+                  AND gameweek IN (
+                      SELECT gameweek FROM sim_decision_log
+                      WHERE sim_manager_id = :sim_manager_id
+                        AND decision_type = 'lineup'
+                        AND (:decided_gw IS NULL OR gameweek < :decided_gw)
+                      GROUP BY gameweek ORDER BY gameweek DESC LIMIT :window_gws
+                  )
+                ORDER BY created_at DESC
             """)
-            rows = db.execute(
-                query, {"sim_manager_id": sim_manager_id, "decided_gw": decided_gw}
-            ).fetchall()
+            rows = db.execute(query, {
+                "sim_manager_id": sim_manager_id, "decided_gw": decided_gw,
+                "window_gws": _SQUAD_STATE_WINDOW_GWS,
+            }).fetchall()
         else:
             query = text("""
                 SELECT dl.gameweek, dl.details
                 FROM decision_log dl
                 WHERE dl.decision_type = 'lineup'
                   AND (:decided_gw IS NULL OR dl.gameweek < :decided_gw)
+                  AND dl.gameweek IN (
+                      SELECT gameweek FROM decision_log
+                      WHERE decision_type = 'lineup'
+                        AND (:decided_gw IS NULL OR gameweek < :decided_gw)
+                      GROUP BY gameweek ORDER BY gameweek DESC LIMIT :window_gws
+                  )
                 ORDER BY dl.created_at DESC
-                LIMIT 50
             """)
-            rows = db.execute(query, {"decided_gw": decided_gw}).fetchall()
+            rows = db.execute(query, {
+                "decided_gw": decided_gw, "window_gws": _SQUAD_STATE_WINDOW_GWS,
+            }).fetchall()
     finally:
         db.close()
 
@@ -199,6 +227,19 @@ def _load_squad_state(
             continue
         squad_ids = details.get("squad_ids", [])
         break
+    else:
+        # Every gameweek in the window was a Free Hit, which cannot happen in a
+        # real season (two per season, never consecutive). Reaching here means
+        # the window is too small or the log is wrong -- and the caller reads an
+        # empty squad_ids as a COLD START, rebuilding from scratch on a 100.0
+        # budget and 15 free transfers. Say so; a silent mid-season rebuild is
+        # the worst outcome this function can produce.
+        logger.error(
+            "All %d gameweeks of lineup history (%s) recorded a Free Hit, so no "
+            "owned squad could be recovered. The caller will treat this as a "
+            "cold start and rebuild the whole squad.",
+            len(final_by_gw), sorted(final_by_gw, reverse=True),
+        )
 
     return SquadState(
         squad_ids=squad_ids,
