@@ -6,7 +6,12 @@ import pandas as pd
 import pulp
 
 from config.strategy import OPTIMISER, SQUAD, OptimiserConfig
-from optimiser.bench_weights import derive_gk_weight, derive_slot_weights
+from optimiser.bench_weights import (
+    bench_gk_weight_for_week,
+    bench_slot_weight_for_week,
+    derive_gk_weight,
+    derive_slot_weights,
+)
 from optimiser.captaincy import scenario_based_captain
 from optimiser.scoring import lambda_mu_for_risk_level, risk_adjusted_score
 
@@ -286,6 +291,7 @@ def _bench_objective(
     weeks: int,
     cfg: OptimiserConfig,
     tag: str,
+    bb_target_week: int | None = None,
 ):
     """Objective terms for the bench, weighted by SLOT rather than uniformly.
 
@@ -301,42 +307,56 @@ def _bench_objective(
     is the week-`w` bench indicator and the slot assignment is made afresh each
     week.
 
+    ``bb_target_week`` (2026-09-06): the week, if any, a Bench Boost is being
+    priced for. That week values every bench slot and the reserve keeper at
+    1.0 -- under the chip they all genuinely play -- via
+    ``optimiser.bench_weights.bench_slot_weight_for_week`` /
+    ``bench_gk_weight_for_week``, shared with ``optimiser/transfers.py`` so the
+    two ILPs never price the bench differently. ``None`` reproduces the
+    ordinary auto-substitution weights in every week, exactly as before this
+    parameter existed.
+
     Adds the slot-assignment constraints to ``prob`` and returns the terms to
-    add to the objective. Slot weights are strictly decreasing, so the solver
-    puts its best bench player in slot 1 without needing an ordering
-    constraint -- it is a maximisation and any other assignment is dominated.
+    add to the objective. Slot weights are strictly decreasing outside the
+    target week, so the solver puts its best bench player in slot 1 without
+    needing an ordering constraint -- it is a maximisation and any other
+    assignment is dominated. In the target week every slot ties at 1.0, so any
+    assignment is equally optimal.
     """
-    weights = [w * cfg.bench_value_weight for w in cfg.bench_slot_weights]
-    gk_weight = cfg.bench_gk_weight * cfg.bench_value_weight
     n = len(player_ids)
+    n_slots = len(cfg.bench_slot_weights)
     outfield = [i for i in range(n) if positions[i] != "GKP"]
     keepers = [i for i in range(n) if positions[i] == "GKP"]
 
     slot = {
         (i, k, w): pulp.LpVariable(f"bench_{tag}_{i}_{k}_{w}", cat="Binary")
         for i in outfield
-        for k in range(len(weights))
+        for k in range(n_slots)
         for w in range(weeks)
     }
     for w in range(weeks):
         for i in outfield:
             prob += (
-                pulp.lpSum(slot[i, k, w] for k in range(len(weights)))
+                pulp.lpSum(slot[i, k, w] for k in range(n_slots))
                 == selected[i] - starting[(i, w)]
             )
-        for k in range(len(weights)):
+        for k in range(n_slots):
             prob += pulp.lpSum(slot[i, k, w] for i in outfield) == 1
 
     terms = pulp.lpSum(
-        weights[k] * scores_pw[(player_ids[i], w)] * slot[i, k, w]
+        bench_slot_weight_for_week(k, w, bb_target_week, cfg)
+        * scores_pw[(player_ids[i], w)]
+        * slot[i, k, w]
         for i in outfield
-        for k in range(len(weights))
+        for k in range(n_slots)
         for w in range(weeks)
     )
     # The reserve keeper has no queue to inherit from: he plays only if the
     # first-choice keeper does not.
     terms += pulp.lpSum(
-        gk_weight * scores_pw[(player_ids[i], w)] * (selected[i] - starting[(i, w)])
+        bench_gk_weight_for_week(w, bb_target_week, cfg)
+        * scores_pw[(player_ids[i], w)]
+        * (selected[i] - starting[(i, w)])
         for i in keepers
         for w in range(weeks)
     )
@@ -474,8 +494,15 @@ def optimise_squad(
     season: str | None = None,
     config: OptimiserConfig | None = None,
     forbidden_squads: list[list[int]] | None = None,
+    bb_target_week: int | None = None,
 ) -> SquadSolution:
-    """``ownership`` (P3-3, optional): a ``(player_id, top10k_selected_pct)``
+    """``bb_target_week`` (optional): the week index (0 = the earliest week in
+    the horizon), if any, a Bench Boost is being built for. That week values
+    the bench at full weight in ``_bench_objective``; every other week keeps
+    the ordinary auto-substitution weights. ``None`` (every call site today)
+    is byte-for-byte identical to before this parameter existed.
+
+    ``ownership`` (P3-3, optional): a ``(player_id, top10k_selected_pct)``
     frame (P3-2) feeding the risk-adjusted objective's differential term.
     ``None`` (the current live reality — EO sampling can't produce real data
     pre-GW1) makes every player's EO 0%, which is a uniform rescale of the
@@ -625,7 +652,8 @@ def optimise_squad(
         prob += _xi_objective(
             selected, starting, captain, vice, scores_pw, player_ids, weeks, cfg
         ) + _bench_objective(
-            prob, selected, starting, scores_pw, player_ids, positions, weeks, cfg, "a"
+            prob, selected, starting, scores_pw, player_ids, positions, weeks, cfg, "a",
+            bb_target_week=bb_target_week,
         )
 
         # Squad-level constraints. These stay on the single horizon-wide
@@ -699,7 +727,8 @@ def optimise_squad(
             prob2 += _xi_objective(
                 selected2, starting2, captain2, vice2, scores_pw, player_ids, weeks, cfg
             ) + _bench_objective(
-                prob2, selected2, starting2, scores_pw, player_ids, positions, weeks, cfg, "b"
+                prob2, selected2, starting2, scores_pw, player_ids, positions, weeks, cfg, "b",
+                bb_target_week=bb_target_week,
             )
             prob2 += pulp.lpSum(selected2) == SQUAD.squad_size
             prob2 += pulp.lpSum(costs[i] * selected2[i] for i in range(n)) <= budget

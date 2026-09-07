@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import logging
 
+from config.strategy import OptimiserConfig
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_SLOTS = 3
@@ -67,3 +69,34 @@ def derive_gk_weight(keeper_start_probability: float) -> float:
     """The reserve keeper plays only if the first choice does not — one keeper,
     one chance, no queue to inherit from."""
     return max(0.0, 1.0 - float(keeper_start_probability))
+
+
+def bench_slot_weight_for_week(
+    slot: int, w: int, bb_target_week: int | None, cfg: OptimiserConfig
+) -> float:
+    """Bench slot weight for one slot in one week.
+
+    Under a bench boost all four bench players play, so every slot is worth
+    1.0 in the target week and the ordinary auto-substitution weights apply
+    everywhere else. A flat 1.0 across the whole horizon would build a squad
+    that is BB-optimal and mediocre in the other 37 weeks.
+
+    Lives here, once, and is imported by BOTH optimiser/squad.py and
+    optimiser/transfers.py. They must not drift: the squad build pays real
+    money for a substitute who plays, and if the weekly transfer ILP valued him
+    lower it would sell him the following week and charge a transfer for the
+    privilege (see transfers.py:417-431). A single definition makes that
+    structural rather than something a test has to notice afterwards.
+    """
+    if bb_target_week is not None and w == bb_target_week:
+        return 1.0
+    return cfg.bench_slot_weights[slot] * cfg.bench_value_weight
+
+
+def bench_gk_weight_for_week(
+    w: int, bb_target_week: int | None, cfg: OptimiserConfig
+) -> float:
+    """As above, for the reserve keeper."""
+    if bb_target_week is not None and w == bb_target_week:
+        return 1.0
+    return cfg.bench_gk_weight * cfg.bench_value_weight

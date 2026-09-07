@@ -6,6 +6,7 @@ import pulp
 
 from config.strategy import OPTIMISER, SQUAD, TRANSFERS, OptimiserConfig, TransferRules
 from data.overrides import load_excluded_player_ids
+from optimiser.bench_weights import bench_gk_weight_for_week, bench_slot_weight_for_week
 from optimiser.departure_risk import confirmed_p_leave, is_hard_excluded
 from optimiser.scoring import lambda_mu_for_risk_level, risk_adjusted_score
 
@@ -125,8 +126,17 @@ def evaluate_transfers(
     bank: float | None = None,
     purchase_prices: dict[int, float] | None = None,
     horizon: int | None = None,
+    bb_target_week: int | None = None,
 ) -> TransferPlan:
-    """``horizon`` (optional): how many gameweeks to plan over. Defaults to
+    """``bb_target_week`` (optional): the week index (0 = the earliest week in
+    the horizon), if any, a Bench Boost is being planned for. That week values
+    the bench at full weight in the bench term below; every other week keeps
+    the ordinary auto-substitution weights, matching
+    ``optimiser.squad._bench_objective`` exactly via the shared
+    ``optimiser.bench_weights`` helpers. ``None`` (every call site today) is
+    byte-for-byte identical to before this parameter existed.
+
+    ``horizon`` (optional): how many gameweeks to plan over. Defaults to
     ``cfg.transfer_planning_horizon_gws``, which is what every ordinary weekly
     call wants. ``optimiser/chips.py`` overrides it with
     ``CHIP_TIMING.wildcard_eval_horizon_gws`` so a wildcard is judged over the
@@ -424,26 +434,29 @@ def evaluate_transfers(
     # for a first substitute who plays, and if this ILP still valued every
     # bench player at a flat 0.15 it would sell him again the following week
     # -- undoing the purchase and charging a transfer for the privilege.
-    # Keeping them in sync is the whole point of this term existing.
+    # Keeping them in sync is the whole point of this term existing. Since
+    # 2026-09-06 that sync is structural, not just a shared intention: both
+    # ILPs price every slot through the SAME imported functions,
+    # bench_slot_weight_for_week/bench_gk_weight_for_week (optimiser/
+    # bench_weights.py), including the Bench Boost target-week override.
     pos_of = dict(zip(pid_list, positions, strict=True))
     outfield_pids = [pid for pid in pid_list if pos_of[pid] != "GKP"]
     keeper_pids = [pid for pid in pid_list if pos_of[pid] == "GKP"]
-    bench_slot_w = [w * cfg.bench_value_weight for w in cfg.bench_slot_weights]
-    bench_gk_w = cfg.bench_gk_weight * cfg.bench_value_weight
+    n_slots = len(cfg.bench_slot_weights)
 
     bslot = {
         (pid, w, k): pulp.LpVariable(f"bslot_{pid}_{w}_{k}", cat="Binary")
         for pid in outfield_pids
         for w in range(H)
-        for k in range(len(bench_slot_w))
+        for k in range(n_slots)
     }
     for w in range(H):
         for pid in outfield_pids:
             prob += (
-                pulp.lpSum(bslot[(pid, w, k)] for k in range(len(bench_slot_w)))
+                pulp.lpSum(bslot[(pid, w, k)] for k in range(n_slots))
                 == squad[(pid, w)] - starting[(pid, w)]
             )
-        for k in range(len(bench_slot_w)):
+        for k in range(n_slots):
             prob += pulp.lpSum(bslot[(pid, w, k)] for pid in outfield_pids) == 1
 
     prob += pulp.lpSum(
@@ -452,12 +465,16 @@ def evaluate_transfers(
         for pid in pid_list
         for w in range(H)
     ) + pulp.lpSum(
-        bench_slot_w[k] * scores_pw[(pid, w)] * bslot[(pid, w, k)]
+        bench_slot_weight_for_week(k, w, bb_target_week, cfg)
+        * scores_pw[(pid, w)]
+        * bslot[(pid, w, k)]
         for pid in outfield_pids
         for w in range(H)
-        for k in range(len(bench_slot_w))
+        for k in range(n_slots)
     ) + pulp.lpSum(
-        bench_gk_w * scores_pw[(pid, w)] * (squad[(pid, w)] - starting[(pid, w)])
+        bench_gk_weight_for_week(w, bb_target_week, cfg)
+        * scores_pw[(pid, w)]
+        * (squad[(pid, w)] - starting[(pid, w)])
         for pid in keeper_pids
         for w in range(H)
     ) + trules.ft_terminal_value * ft[H] - pulp.lpSum(
