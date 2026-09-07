@@ -3,12 +3,18 @@
 Pure computation over a match calendar, tested without a database so the
 semantics are pinned independently of whether the FBref backfill has run."""
 
+import logging
 from datetime import datetime
 
 import pandas as pd
 import pytest
 
-from projection.congestion import CONGESTION_FEATURE_COLS, compute_congestion
+from projection.congestion import (
+    CONGESTION_FEATURE_COLS,
+    compute_congestion,
+    dateless_kickoff_share,
+    warn_on_dateless_kickoffs,
+)
 
 
 def _matches(rows: list[tuple]) -> pd.DataFrame:
@@ -305,3 +311,68 @@ def test_the_break_flag_agrees_on_every_no_previous_match_path():
     for frame in (opener, absent, empty):
         assert frame["days_since_last_match"].iloc[0] == 14.0
         assert frame["is_post_international_break"].iloc[0] == 1.0
+
+
+# --- date-only kickoff detection -------------------------------------------
+#
+# 12a6387 taught the ingest to read FBref's separate `time` column, but the
+# backfill is resumable and journals completed jobs, so a table written before
+# that fix keeps its midnight timestamps until someone runs --reset. On
+# 2026-09-07 the live table was in exactly that state: all 4560 PL rows at
+# midnight, all 493 European rows with real kickoffs. Nothing noticed.
+
+
+def test_a_calendar_of_real_kickoffs_is_not_flagged():
+    assert dateless_kickoff_share(_matches([
+        ("2025-26", 1, datetime(2025, 10, 1, 20, 0), "UCL"),
+        ("2025-26", 1, datetime(2025, 10, 4, 15, 0), "PL"),
+    ])) == 0.0
+
+
+def test_a_wholly_midnight_calendar_is_flagged():
+    assert dateless_kickoff_share(_matches([
+        ("2025-26", 1, datetime(2025, 10, 1), "UCL"),
+        ("2025-26", 1, datetime(2025, 10, 4), "PL"),
+    ])) == 1.0
+
+
+def test_the_mixed_state_that_actually_shipped_is_flagged():
+    """The live failure: European rows timed, PL rows not. The bias falls on
+    exactly the fixture pattern the feature exists to measure -- a 20:00
+    Tuesday UCL followed by a midnight Saturday PL reads 3.17 rest-days
+    instead of 3.79, and always UNDERSTATES rest. Uniform midnight was at
+    least unbiased, so a half-applied fix is worse than none."""
+    assert dateless_kickoff_share(_matches([
+        ("2025-26", 1, datetime(2025, 10, 1, 20, 0), "UCL"),
+        ("2025-26", 1, datetime(2025, 10, 4), "PL"),
+    ])) == pytest.approx(0.5)
+
+
+def test_an_empty_calendar_does_not_divide_by_zero():
+    assert dateless_kickoff_share(_matches([])) == 0.0
+
+
+def test_string_kickoffs_are_read_as_timestamps_not_compared_as_text():
+    """read_sql over SQLite hands back strings, not datetimes."""
+    assert dateless_kickoff_share(_matches([
+        ("2025-26", 1, "2025-10-01 20:00:00.000000", "UCL"),
+        ("2025-26", 1, "2025-10-04 00:00:00.000000", "PL"),
+    ])) == pytest.approx(0.5)
+
+
+def test_the_warning_names_the_command_that_fixes_it(caplog):
+    """A warning that does not say what to run gets ignored for weeks -- which
+    is how long a stale-schema database ran in production here before."""
+    with caplog.at_level(logging.WARNING, logger="projection.congestion"):
+        warn_on_dateless_kickoffs(_matches([
+            ("2025-26", 1, datetime(2025, 10, 4), "PL"),
+        ]))
+    assert "backfill_team_matches.py --reset" in caplog.text
+
+
+def test_no_warning_when_the_calendar_is_sound(caplog):
+    with caplog.at_level(logging.WARNING, logger="projection.congestion"):
+        warn_on_dateless_kickoffs(_matches([
+            ("2025-26", 1, datetime(2025, 10, 4, 15, 0), "PL"),
+        ]))
+    assert caplog.text == ""

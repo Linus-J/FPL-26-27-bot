@@ -46,6 +46,48 @@ INTERNATIONAL_BREAK_DAYS = 14.0
 
 EURO_TIERS = {"UECL": 1.0, "UEL": 2.0, "UCL": 3.0}
 
+# A calendar that is even partly date-only is worse than one that is wholly so.
+# The rest-day gap is (this kickoff - the previous one), so mixing true evening
+# kickoffs with midnight ones biases the answer in one direction rather than
+# merely coarsening it -- and it biases the European midweek case, which is the
+# only case these features exist to measure. Warn above a share this small
+# because there is no legitimate reason for ANY fixture to sit at 00:00.
+DATELESS_KICKOFF_WARN_SHARE = 0.01
+
+
+def dateless_kickoff_share(matches: pd.DataFrame) -> float:
+    """Fraction of the calendar sitting at exactly midnight.
+
+    No football match kicks off at 00:00, so this is a direct measure of how
+    much of ``team_matches`` was written before the ingest learned to read
+    FBref's separate ``time`` column (12a6387).
+    """
+    if matches.empty:
+        return 0.0
+    kickoffs = pd.to_datetime(matches["kickoff_time"], errors="coerce")
+    return float((kickoffs.dt.normalize() == kickoffs).mean())
+
+
+def warn_on_dateless_kickoffs(matches: pd.DataFrame) -> None:
+    """Say so, loudly and with the remedy, when the calendar has no clock.
+
+    Silent staleness is this project's recurring failure: the backfill journals
+    completed jobs, so re-running it without ``--reset`` leaves pre-fix rows
+    untouched and reports success. Naming the command matters -- a warning that
+    does not say what to run is a warning that gets scrolled past.
+    """
+    share = dateless_kickoff_share(matches)
+    if share <= DATELESS_KICKOFF_WARN_SHARE:
+        return
+    logger.warning(
+        "%.0f%% of the match calendar sits at exactly midnight: those rows "
+        "predate the kickoff-time ingest fix, so rest-days are understated and "
+        "matches can anchor to the wrong gameweek. Re-run: "
+        "DB_PATH=fpl_bot_v2.db FBREF_HEADED=1 uv run python "
+        "scripts/backfill_team_matches.py --reset",
+        share * 100,
+    )
+
 
 def compute_congestion(matches: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFrame:
     """Congestion features for each (season, team_id, gameweek) anchor.
@@ -201,6 +243,8 @@ def load_congestion(season: str | None = None) -> pd.DataFrame:
         )
     finally:
         db.close()
+
+    warn_on_dateless_kickoffs(matches)
 
     if anchors.empty:
         logger.warning("load_congestion: no PL anchors found; features will be absent")
