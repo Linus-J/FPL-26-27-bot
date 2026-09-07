@@ -3,14 +3,10 @@
 Tier 1 only — the tier that feeds a decision. It searches the persisted 5-GW
 projection window for the week whose bench is worth most."""
 
-import dataclasses
-
 import pandas as pd
 import pytest
 
-from config.strategy import OPTIMISER
 from optimiser.bench_boost import (
-    bb_ready_config,
     bench_xpts_by_gameweek,
     select_bb_target_gw,
 )
@@ -28,20 +24,6 @@ def _projections(bench_pts_by_gw: dict[int, float]) -> pd.DataFrame:
         for pid in BENCH:
             rows.append({"player_id": pid, "gameweek": gw, "xpts": bench_pts / 4.0})
     return pd.DataFrame(rows)
-
-
-def test_bb_ready_config_forces_full_bench_weight():
-    """Under a bench boost the bench genuinely plays. Full weight is a fact
-    about the rules, not a risk preference."""
-    base = dataclasses.replace(OPTIMISER, bench_value_weight=0.5)
-    out = bb_ready_config(base, target_gw=7)
-    assert out.bench_value_weight == 1.0
-
-
-def test_bb_ready_config_leaves_the_base_untouched():
-    base = dataclasses.replace(OPTIMISER, bench_value_weight=0.5)
-    bb_ready_config(base, target_gw=7)
-    assert base.bench_value_weight == 0.5
 
 
 def test_bench_totals_are_computed_per_gameweek():
@@ -79,3 +61,31 @@ def test_the_current_week_can_itself_be_the_target():
 
 def test_an_empty_projection_frame_yields_no_target():
     assert select_bb_target_gw(SQUAD, pd.DataFrame(), 4, 20.0) is None
+
+
+# --- B8 (2026-09-07): one mechanism, not two --------------------------------
+
+def test_bb_ready_config_is_gone():
+    """One mechanism, not two. bb_ready_config was a no-op — bench_value_weight
+    is already 1.0 and is a MULTIPLIER on the slot weights, so it could never
+    produce a full-weight bench. bb_target_week is the switch that works."""
+    import optimiser.bench_boost as bb
+
+    assert not hasattr(bb, "bb_ready_config")
+
+
+def test_horizon_and_index_for_a_target_week():
+    """The horizon must REACH the target week, and bb_target_week is the
+    target's index within it. A target two gameweeks out needs horizon 3 and
+    index 2."""
+    from optimiser.bench_boost import bb_horizon_and_index
+
+    assert bb_horizon_and_index(next_gw=4, target_gw=6) == (3, 2)
+    assert bb_horizon_and_index(next_gw=4, target_gw=4) == (1, 0)
+
+
+def test_a_target_before_the_current_week_is_rejected():
+    from optimiser.bench_boost import bb_horizon_and_index
+
+    with pytest.raises(ValueError):
+        bb_horizon_and_index(next_gw=6, target_gw=4)

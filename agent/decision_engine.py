@@ -21,7 +21,7 @@ from data.ingestors.ownership import load_latest_ownership
 from data.models import ChipComparisonLog, DecisionLog, SimDecisionLog, SimManager
 from data.overrides import apply_team_overrides, load_p_leave_overrides, log_rumoured_squad_members
 from optimiser.bench_boost import (
-    bb_ready_config,
+    bb_horizon_and_index,
     bench_xpts_by_gameweek,
     pivot_price,
     select_bb_target_gw,
@@ -420,21 +420,42 @@ def _bench_boost_readiness(
     if target is None:
         return {
             "target_gameweek": None,
+            # 2026-09-07 (B8): name the bar that was actually applied. The
+            # chip DECISION (`optimiser/chips.py::_try_bb`) shrinks this same
+            # number by `_panic_shrink` as a half's expiry approaches, so late
+            # in a half it can be holding for a target this report calls
+            # non-existent. Reporting the standing bar and saying so is
+            # honest; shrinking it here too would change which squad gets
+            # built, which is a decision this report deliberately does not
+            # make.
             "reason": (
-                "no gameweek in the projection window clears the bench-boost "
-                f"threshold ({chip_timing.bench_boost_min_bench_xpts:.1f} xPts)"
+                "no gameweek in the projection window clears the standing "
+                "bench-boost threshold of "
+                f"{chip_timing.bench_boost_min_bench_xpts:.1f} xPts (the chip "
+                "decision discounts this bar near a half's expiry, so it may "
+                "still be holding for a week below it)"
             ),
         }
     target_gw, unconstrained_bench_xpts = target
+    # 2026-09-07 (B8): the horizon has to REACH the target week and
+    # `bb_target_week` names it within that horizon. This used to pass
+    # `horizon=1, gameweek=target_gw` on the full frame — but `optimise_squad`
+    # takes its weeks as `sorted(unique gameweeks)[:horizon]`, so that
+    # optimised NEXT_GW, while the bench below was measured at `target_gw`.
+    # `gameweek=` only ever fed the joint-risk covariance matrices; it never
+    # selected a week, so it is gone. The frame stays whole: ordinary
+    # auto-substitution weights in every ordinary week, full weight only in
+    # the week the chip would fire.
+    horizon, bb_target_week = bb_horizon_and_index(next_gw, target_gw)
     bb_solution = optimise_squad_joint(
         projections,
         players,
         budget=available_budget,
-        horizon=1,
+        horizon=horizon,
+        bb_target_week=bb_target_week,
         season=season,
-        gameweek=target_gw,
         ownership=ownership,
-        config=bb_ready_config(config, target_gw),
+        config=config,
     )
     bb_ready_ids = bb_solution.squad["id"].tolist()
     bb_ready_bench_xpts = bench_xpts_by_gameweek(

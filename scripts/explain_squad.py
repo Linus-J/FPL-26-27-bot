@@ -55,7 +55,7 @@ from config.strategy import CHIP_TIMING, OPTIMISER, SQUAD  # noqa: E402
 from data.db import get_session  # noqa: E402
 from data.ingestors.odds_api import odds_coverage_by_gameweek  # noqa: E402
 from optimiser.bench_boost import (  # noqa: E402
-    bb_ready_config,
+    bb_horizon_and_index,
     bench_xpts_by_gameweek,
     pivot_price,
     select_bb_target_gw,
@@ -275,9 +275,16 @@ def _bb_readiness_section(
     target = select_bb_target_gw(unconstrained_ids, projections, current_gw, threshold)
 
     if target is None:
+        # The bar named here is the STANDING one. The chip decision
+        # (`optimiser/chips.py::_try_bb`) discounts it via `_panic_shrink` as a
+        # half's expiry approaches, so late in a half it can be holding for a
+        # target this section calls non-existent -- say so rather than
+        # shrinking it here, which would change which squad gets built.
         lines = [
-            f"**No gameweek in the projection window clears the bench-boost threshold "
-            f"({threshold:.1f} xPts)** -- no BB-ready squad was built."
+            f"**No gameweek in the projection window clears the standing bench-boost "
+            f"threshold of {threshold:.1f} xPts** -- no BB-ready squad was built. "
+            f"(The chip decision discounts this bar near a half's expiry, so it may "
+            f"still be holding for a week below it.)"
         ]
         if totals:
             best_gw = max(totals, key=lambda gw: totals[gw])
@@ -287,10 +294,17 @@ def _bb_readiness_section(
         return lines
 
     target_gw, unconstrained_bench_xpts = target
-    target_projections = projections[projections["gameweek"] == target_gw]
+    # 2026-09-07 (B8): the whole frame, with the horizon reaching the target
+    # week and `bb_target_week` naming it inside that horizon -- the same
+    # wiring `agent/decision_engine.py::_bench_boost_readiness` uses, so the
+    # two call sites build the same squad. Filtering the frame to the target
+    # week built a squad that was boost-optimal there and mediocre everywhere
+    # else, which is not the squad anyone would actually carry.
+    horizon, bb_target_week = bb_horizon_and_index(current_gw, target_gw)
     bb_solution = optimise_squad(
-        projections=target_projections, players=players, budget=SQUAD.budget_total,
-        horizon=1, season=season, config=bb_ready_config(OPTIMISER, target_gw),
+        projections=projections, players=players, budget=SQUAD.budget_total,
+        horizon=horizon, bb_target_week=bb_target_week, season=season,
+        config=OPTIMISER,
     )
     bb_ready_ids = bb_solution.squad["id"].tolist()
     bb_ready_bench_xpts = bench_xpts_by_gameweek(

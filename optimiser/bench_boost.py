@@ -20,26 +20,36 @@ and must never be read by a squad or chip decision.
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 
 import pandas as pd
 
-from config.strategy import OptimiserConfig
-
 logger = logging.getLogger(__name__)
 
 
-def bb_ready_config(base: OptimiserConfig, target_gw: int) -> OptimiserConfig:
-    """`base` with the bench valued at full weight for the target week.
+def bb_horizon_and_index(next_gw: int, target_gw: int) -> tuple[int, int]:
+    """The horizon and target index to hand ``optimise_squad`` for a boost week.
 
-    Under a bench boost every bench player actually plays, so weight 1.0 is a
-    fact about the rules rather than a risk preference — which is why this
-    overrides `bench_value_weight` outright. A persona running at 0.5 must not
-    silently end up half as BB-ready as one at 1.0; that would be a risk
-    setting leaking into a rules question.
+    ``optimise_squad`` slices its weeks as ``sorted(unique gameweeks)[:horizon]``
+    from a frame starting at ``next_gw``, so the horizon must REACH the target
+    week and ``bb_target_week`` is the target's index within it.
+
+    Optimising over the whole span rather than the target week alone is what
+    the design always wanted: ordinary auto-substitution weights in every
+    ordinary week, full weight only in the week the chip fires. A squad built
+    for the target week in isolation would be boost-optimal and mediocre in
+    every other week.
+
+    Replaces `bb_ready_config` (2026-09-07), which was a no-op: it set
+    `bench_value_weight` to 1.0, which is already the default, and that field
+    is a MULTIPLIER on `bench_slot_weights` (0.53, 0.15, 0.03) rather than a
+    replacement for them — so it could never produce the full-weight bench a
+    boost actually plays. `bb_target_week` is the switch that does, and it is
+    threaded into both integer programs.
     """
-    return dataclasses.replace(base, bench_value_weight=1.0)
+    if target_gw < next_gw:
+        raise ValueError(f"target gameweek {target_gw} is before {next_gw}")
+    return target_gw - next_gw + 1, target_gw - next_gw
 
 
 def bench_xpts_by_gameweek(
@@ -48,8 +58,13 @@ def bench_xpts_by_gameweek(
     """Total xPts of the four bench players, per gameweek from `current_gw` on.
 
     The bench is defined per gameweek as the four lowest-scoring squad members
-    that week — which is what the auto-substitution order would make it, and
-    what a bench boost would actually play.
+    that week. That is a LOWER BOUND on what auto-substitution would actually
+    field, not a reproduction of it: it ignores FPL's formation and
+    goalkeeper rules, so it can name a "bench" holding both keepers, which no
+    legal XI would leave there. The error is one-directional and therefore
+    safe — a legal bench can only swap one of these players for a
+    higher-scoring one, so this figure understates bench value and the chip
+    fires less often than it should, never more.
     """
     if projections.empty:
         return {}
@@ -101,8 +116,15 @@ def should_hold_bench_boost(
 
     True only when the target is strictly ahead of `current_gw` and beats this
     week by more than `margin`. A margin rather than a bare argmax because
-    projections a few weeks out are mostly strength-model output: without one,
-    ordinary noise would defer the chip week after week until it expired.
+    projections a few weeks out are mostly strength-model output, and without
+    one ordinary noise would defer the chip on nothing but sampling error.
+
+    The margin is NOT what stops the chip being deferred all the way to expiry
+    (2026-09-07) — `must_play_a_chip_now` is, via the salvage force in
+    `optimiser/chips.py`. A sliding window whose far end always looks 2+ points
+    better would defer every single week regardless of how large this margin
+    were, right up until salvage forced it through. Anyone tuning `margin`
+    expecting it to do that job will be tuning the wrong number.
     """
     if target is None:
         return False

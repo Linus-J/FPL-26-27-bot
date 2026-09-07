@@ -681,3 +681,86 @@ def test_chips_used_this_season_parses_chip_from_json_details():
 
 def test_chips_used_this_season_empty_log_returns_empty_list():
     assert chips.chips_used_this_season(pd.DataFrame()) == []
+
+
+# --- B8 (2026-09-07): the bench-boost hold -----------------------------------
+
+_BB_SQUAD = list(range(1, 16))
+
+
+def _bb_frame(rows_by_gw: dict[int, list[float]]) -> pd.DataFrame:
+    """One row per (player, gameweek) from an explicit per-week xPts list.
+
+    A week's list may be shorter than fifteen -- that is the point of
+    ``test_the_hold_compares_both_weeks_by_the_same_bench_definition``: a squad
+    member with no projection row that week.
+    """
+    rows = []
+    for gw, values in rows_by_gw.items():
+        for pid, xpts in zip(_BB_SQUAD, values, strict=False):
+            rows.append({"player_id": pid, "gameweek": gw, "xpts": xpts})
+    return pd.DataFrame(rows)
+
+
+def test_the_hold_compares_both_weeks_by_the_same_bench_definition():
+    """Both sides of the hold comparison must come from one bench definition.
+
+    The caller's ``bench_xpts`` sums the rows past index 11 of that week's
+    frame, so a squad member missing a projection row leaves it summing THREE
+    players while the target week's figure sums four. That understated the
+    current week and held a chip that should have fired.
+
+    GW10 is missing player 15, so the two definitions read 21.0 and 31.0 for
+    the same bench. GW11's bench is 32.5. Against 31.0 the gap is 1.5, inside
+    the 2.0 hold margin; against 21.0 it is 11.5 and the chip is held.
+    """
+    projections = _bb_frame({
+        10: [10.0] * 11 + [7.0] * 3,          # player 15 has no row this week
+        11: [10.0] * 11 + [8.125] * 4,        # bench 32.5
+    })
+    rec = chips.recommend_chip(
+        current_gw=10, current_squad_ids=_BB_SQUAD, projections=projections,
+        players=pd.DataFrame(), available_budget=100.0, free_transfers=1,
+        season=None, bench_xpts=21.0,
+        chips_used=[
+            (chips.Chip.TRIPLE_CAPTAIN, 9),
+            (chips.Chip.FREE_HIT, 9),
+            (chips.Chip.WILDCARD, 9),
+        ],
+        squad_age_gws=0,
+    )
+    assert rec.chip == chips.Chip.BENCH_BOOST
+
+
+def test_a_holdable_bench_boost_is_still_forced_through_by_the_salvage_path():
+    """The salvage block runs candidate(force=True) when a chip must be played
+    before it expires. Holding there would destroy the very chip being
+    rescued. The guard exists; nothing pinned it.
+
+    GW20's bench (30.0) beats every earlier week's (25.0) by more than the 2.0
+    hold margin, so the ordinary pass holds. At GW19 -- the half boundary, with
+    Bench Boost the only chip left -- holding would bin it.
+    """
+    projections = _bb_frame({
+        gw: [10.0] * 11 + [6.25] * 4 for gw in (16, 17, 18, 19)   # bench 25.0
+    } | {20: [10.0] * 11 + [7.5] * 4})                            # bench 30.0
+    used_at = [chips.Chip.TRIPLE_CAPTAIN, chips.Chip.FREE_HIT, chips.Chip.WILDCARD]
+
+    # Four gameweeks of slack: the hold is a real decision and wins.
+    held = chips.recommend_chip(
+        current_gw=16, current_squad_ids=_BB_SQUAD, projections=projections,
+        players=pd.DataFrame(), available_budget=100.0, free_transfers=1,
+        season=None, bench_xpts=25.0,
+        chips_used=[(c, 15) for c in used_at], squad_age_gws=0,
+    )
+    assert held.chip is None
+
+    # At the boundary there is no next week, so the salvage force must win.
+    forced = chips.recommend_chip(
+        current_gw=19, current_squad_ids=_BB_SQUAD, projections=projections,
+        players=pd.DataFrame(), available_budget=100.0, free_transfers=1,
+        season=None, bench_xpts=25.0,
+        chips_used=[(c, 18) for c in used_at], squad_age_gws=0,
+    )
+    assert forced.chip == chips.Chip.BENCH_BOOST
+    assert "Forced before expiry" in forced.reason

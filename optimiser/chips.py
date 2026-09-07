@@ -9,7 +9,11 @@ from sqlalchemy import text
 
 from config.strategy import CHIP_TIMING, CHIPS, ChipTimingThresholds, OptimiserConfig
 from data.db import get_session
-from optimiser.bench_boost import select_bb_target_gw, should_hold_bench_boost
+from optimiser.bench_boost import (
+    bench_xpts_by_gameweek,
+    select_bb_target_gw,
+    should_hold_bench_boost,
+)
 from optimiser.chip_comparison import ChipComparison
 from optimiser.chip_scenarios import gain_distribution, load_scenario_totals
 from optimiser.squad import optimise_squad
@@ -485,12 +489,24 @@ def recommend_chip(
             target = select_bb_target_gw(
                 current_squad_ids, projections, current_gw, threshold
             )
+            # Both sides of this comparison come from ONE bench definition
+            # (2026-09-07). The caller's `bench_xpts` sums the rows past index
+            # 11 of the current week's frame, so a squad member with no
+            # projection row that week left it summing THREE players while
+            # `select_bb_target_gw` summed four for the target -- understating
+            # the current week and holding a chip that should have fired. The
+            # threshold gate above still uses the caller's figure: that is the
+            # number the recommendation is reported and scored on, and it is
+            # the conservative one.
+            current_bench = bench_xpts_by_gameweek(
+                current_squad_ids, projections, current_gw
+            ).get(current_gw, 0.0)
             if should_hold_bench_boost(
-                current_gw, bench_xpts, target, timing.bench_boost_hold_margin_xpts
+                current_gw, current_bench, target, timing.bench_boost_hold_margin_xpts
             ):
                 logger.info(
                     "BB held: GW%d bench worth %.2f beats GW%d's %.2f by more than %.2f",
-                    target[0], target[1], current_gw, bench_xpts,
+                    target[0], target[1], current_gw, current_bench,
                     timing.bench_boost_hold_margin_xpts,
                 )
                 return None
