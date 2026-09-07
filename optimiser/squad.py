@@ -547,6 +547,19 @@ def optimise_squad(
     horizon_gws = sorted(projections["gameweek"].unique())[:horizon]
     target_gw = horizon_gws[0] if horizon_gws else None
 
+    # The bench-boost override is `if w == bb_target_week` (bench_weights.py),
+    # so an index past the last week in this slice matches nothing and silently
+    # changes no coefficient -- the same shape of failure as the bb_ready_config
+    # no-op this replaced. `bb_horizon_and_index` derives the index by
+    # ARITHMETIC (target_gw - next_gw) while the slice above is by POSITION;
+    # they agree only while the frame's gameweeks are consecutive. Raise rather
+    # than quietly build an unboosted squad and report it as boost-ready.
+    if bb_target_week is not None and not 0 <= bb_target_week < len(horizon_gws):
+        raise ValueError(
+            f"bb_target_week={bb_target_week} is outside the {len(horizon_gws)}-week "
+            f"horizon {horizon_gws}; it would price no week at full bench weight"
+        )
+
     # Two aggregates over the same horizon (2026-08-18): the TRUE sum, which
     # is what gets reported, and the decayed sum. See _decay_weights — a
     # projection five gameweeks out is not worth as much as one for the match

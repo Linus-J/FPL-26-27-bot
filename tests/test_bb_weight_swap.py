@@ -49,3 +49,25 @@ def test_both_ilps_price_the_bench_through_one_definition():
         is transfers_mod.bench_slot_weight_for_week
         is bench_slot_weight_for_week
     )
+
+
+def test_a_target_week_outside_the_horizon_is_rejected_rather_than_ignored():
+    """The override is `if w == bb_target_week`, so an index past the last week
+    in the slice matches nothing and silently does nothing -- which is exactly
+    the failure bb_ready_config already shipped once: a switch that looks wired
+    and changes no coefficient.
+
+    Reachable whenever the frame has fewer distinct gameweeks than the horizon
+    the target implies, e.g. a frame that skips a gameweek. bb_horizon_and_index
+    derives the index by ARITHMETIC (target_gw - next_gw) while optimise_squad
+    slices by POSITION, and the two agree only while the weeks are consecutive.
+    """
+    import pandas as pd
+
+    from optimiser.squad import optimise_squad
+
+    frame = pd.DataFrame({"gameweek": [4, 5], "player_id": [1, 2], "xpts": [1.0, 1.0]})
+    with pytest.raises(ValueError, match="bb_target_week"):
+        optimise_squad(
+            projections=frame, players=pd.DataFrame(), horizon=2, bb_target_week=2,
+        )
