@@ -59,7 +59,7 @@ def test_an_unknown_club_resolves_to_none():
 def test_every_code_in_the_live_registry_has_a_name():
     """The table must cover every club team_season_strength knows about, or the
     backfill dies on a season it cannot name."""
-    conn = sqlite3.connect(_LIVE_DB)
+    conn = sqlite3.connect(f"file:{_LIVE_DB}?mode=ro", uri=True)
     try:
         codes = {r[0] for r in conn.execute("SELECT DISTINCT code FROM team_season_strength")}
     finally:
