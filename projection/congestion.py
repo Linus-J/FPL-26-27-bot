@@ -116,6 +116,16 @@ def compute_congestion(matches: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataF
 def load_congestion(season: str | None = None) -> pd.DataFrame:
     """Congestion features per (season, team_id, gameweek), from the database.
 
+    ``team_matches`` is keyed on the STABLE FPL club ``code`` (see
+    ``data/ingestors/club_codes.py``: ``teams.id`` is reassigned every season
+    and ``teams`` holds only the current 20 clubs, while the calendar spans
+    29). Both queries below join ``team_season_strength`` to resolve that code
+    back to the season's own ``team_id`` before returning — callers still see
+    exactly ``season, team_id, gameweek`` plus the six feature columns, the
+    season-correct id. A club with no ``team_season_strength`` row for a
+    season was not in the Premier League that season and is correctly dropped
+    by the inner join.
+
     The anchor is the team's own PL kickoff in that gameweek, read from
     ``team_matches`` itself rather than ``fixtures`` — so this works identically
     for the five backfilled seasons (which have no ``fixtures`` rows at all) and
@@ -124,17 +134,25 @@ def load_congestion(season: str | None = None) -> pd.DataFrame:
     """
     db = get_session()
     try:
-        where = "WHERE season = :season" if season else ""
+        where = "WHERE tm.season = :season" if season else ""
         params = {"season": season} if season else {}
         matches = pd.read_sql(
-            text(f"SELECT season, team_id, kickoff_time, competition FROM team_matches {where}"),
+            text(f"""
+                SELECT tm.season, tss.team_id AS team_id, tm.kickoff_time, tm.competition
+                FROM team_matches tm
+                JOIN team_season_strength tss
+                  ON tss.season = tm.season AND tss.code = tm.team_code
+                {where}
+            """),
             db.bind, params=params,
         )
         anchors = pd.read_sql(
             text(f"""
-                SELECT tm.season, tm.team_id, g.id AS gameweek,
+                SELECT tm.season, tss.team_id AS team_id, g.id AS gameweek,
                        MIN(tm.kickoff_time) AS anchor_time
                 FROM team_matches tm
+                JOIN team_season_strength tss
+                  ON tss.season = tm.season AND tss.code = tm.team_code
                 JOIN gameweeks g
                   ON g.season = tm.season
                  AND tm.kickoff_time >= g.deadline_time
@@ -143,7 +161,7 @@ def load_congestion(season: str | None = None) -> pd.DataFrame:
                          WHERE g2.season = g.season AND g2.id > g.id),
                        '9999-12-31')
                 WHERE tm.competition = 'PL' {"AND tm.season = :season" if season else ""}
-                GROUP BY tm.season, tm.team_id, g.id
+                GROUP BY tm.season, tss.team_id, g.id
             """),
             db.bind, params=params,
         )

@@ -158,14 +158,19 @@ class TeamMatch(Base):
     __tablename__ = "team_matches"
     __table_args__ = (
         UniqueConstraint(
-            "season", "team_id", "kickoff_time", name="uq_team_match"
+            "season", "team_code", "kickoff_time", name="uq_team_match"
         ),
-        Index("ix_team_match_season_team", "season", "team_id"),
+        Index("ix_team_match_season_code", "season", "team_code"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     season: Mapped[str] = mapped_column(String(7), nullable=False)
-    team_id: Mapped[int] = mapped_column(Integer, ForeignKey("teams.id"), nullable=False)
+    # The STABLE FPL club code, not teams.id. teams.id is reassigned every
+    # season -- 19 of 29 clubs change id across the six backfilled seasons --
+    # and `teams` holds only the current 20 while this calendar spans 29. No
+    # foreign key: the historical clubs have no `teams` row to point at.
+    # team_season_strength(season, code) resolves this to a season's team_id.
+    team_code: Mapped[int] = mapped_column(Integer, nullable=False)
     kickoff_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     # "PL" | "UCL" | "UEL" | "UECL" — see data.ingestors.leagues.COMPETITIONS
     competition: Mapped[str] = mapped_column(String(8), nullable=False)

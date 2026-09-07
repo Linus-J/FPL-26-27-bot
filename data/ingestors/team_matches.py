@@ -18,8 +18,9 @@ import pandas as pd
 from sqlalchemy.dialects.sqlite import insert
 
 from data.db import get_session
+from data.ingestors.club_codes import resolve_club
 from data.ingestors.leagues import COMPETITIONS, register_leagues
-from data.models import Team, TeamMatch
+from data.models import TeamMatch
 
 logger = logging.getLogger(__name__)
 
@@ -34,24 +35,29 @@ class UnmappedClubError(RuntimeError):
 
 
 def _normalize(name: str) -> str:
-    """Lowercase, strip punctuation and collapse whitespace.
+    """Lowercase, strip punctuation, collapse whitespace.
 
-    Same shape as ``fbref._normalize_name`` but for clubs rather than players.
+    The collapse is load-bearing: removing "&" from "Brighton & Hove Albion"
+    leaves a double space, and an alias table keyed on single spaces would then
+    silently fail to match — the same class of invisible name-matching failure
+    that data/ingestors/odds_api.py:140-160 records as a measured production
+    incident.
     """
-    return re.sub(r"[^a-z0-9 ]", "", str(name).lower()).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", str(name).lower())).strip()
 
 
 def build_team_rows(
     schedule: pd.DataFrame,
     season: str,
     competition: str,
-    team_ids: dict[str, int],
 ) -> list[dict]:
     """Explode an FBref schedule into per-team calendar rows.
 
-    ``team_ids`` maps a NORMALISED club name to an FPL ``teams.id``. A club
-    absent from it is treated as non-PL: skipped in a European schedule (Real
-    Madrid is not supposed to be there), fatal in a domestic one.
+    Club names are resolved to the stable FPL ``code`` via
+    ``data.ingestors.club_codes.resolve_club``, not to ``teams.id`` — see
+    ``data/ingestors/club_codes.py`` for why. A club it cannot resolve is
+    treated as non-PL: skipped in a European schedule (Real Madrid is not
+    supposed to be there), fatal in a domestic one.
     """
     rows: list[dict] = []
     for _, match in schedule.iterrows():
@@ -59,25 +65,25 @@ def build_team_rows(
         if pd.isna(kickoff):
             continue
         home_raw, away_raw = match["home_team"], match["away_team"]
-        home, away = _normalize(home_raw), _normalize(away_raw)
+        home_code, away_code = resolve_club(home_raw), resolve_club(away_raw)
 
         if competition == "PL":
-            for raw, norm in ((home_raw, home), (away_raw, away)):
-                if norm not in team_ids:
+            for raw, code in ((home_raw, home_code), (away_raw, away_code)):
+                if code is None:
                     raise UnmappedClubError(
                         f"{raw!r} in the {season} Premier League schedule has no "
-                        f"teams row. Add it to soccerdata's teamname_replacements "
-                        f"or to the teams table before re-running."
+                        f"club code. Add it to data.ingestors.club_codes before "
+                        f"re-running."
                     )
 
-        for team_norm, opponent_raw, is_home in (
-            (home, away_raw, True), (away, home_raw, False)
+        for team_code, opponent_raw, is_home in (
+            (home_code, away_raw, True), (away_code, home_raw, False)
         ):
-            if team_norm not in team_ids:
+            if team_code is None:
                 continue
             rows.append({
                 "season": season,
-                "team_id": team_ids[team_norm],
+                "team_code": team_code,
                 "kickoff_time": kickoff.to_pydatetime(),
                 "competition": competition,
                 "opponent_name": str(opponent_raw),
@@ -86,23 +92,10 @@ def build_team_rows(
     return rows
 
 
-def build_club_name_map() -> dict[str, int]:
-    """Normalised club name -> ``teams.id``, from both name and short_name."""
-    db = get_session()
-    try:
-        mapping: dict[str, int] = {}
-        for team in db.query(Team).all():
-            mapping[_normalize(team.name)] = team.id
-            if getattr(team, "short_name", None):
-                mapping[_normalize(team.short_name)] = team.id
-        return mapping
-    finally:
-        db.close()
-
-
 def write_team_matches(rows: list[dict]) -> int:
-    """Upsert calendar rows. Idempotent on (season, team_id, kickoff_time), so
-    re-running a season after a partial failure is safe and is the whole point.
+    """Upsert calendar rows. Idempotent on (season, team_code, kickoff_time),
+    so re-running a season after a partial failure is safe and is the whole
+    point.
     """
     if not rows:
         return 0
@@ -110,7 +103,7 @@ def write_team_matches(rows: list[dict]) -> int:
     try:
         stmt = insert(TeamMatch).values(rows)
         stmt = stmt.on_conflict_do_update(
-            index_elements=["season", "team_id", "kickoff_time"],
+            index_elements=["season", "team_code", "kickoff_time"],
             set_={
                 "competition": stmt.excluded.competition,
                 "opponent_name": stmt.excluded.opponent_name,
@@ -138,7 +131,7 @@ def ingest_competition_season(season: str, league: str) -> int:  # pragma: no co
     schedule = fbref.read_schedule().reset_index()
     schedule.columns = [str(c).lower().replace(" ", "_") for c in schedule.columns]
 
-    rows = build_team_rows(schedule, season, competition, build_club_name_map())
+    rows = build_team_rows(schedule, season, competition)
     written = write_team_matches(rows)
     logger.info("%s %s: %d calendar rows", league, season, written)
     return written

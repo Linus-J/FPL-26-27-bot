@@ -80,6 +80,29 @@ def migrate(engine: Engine) -> bool:
     return True
 
 
+def rebuild_team_matches_on_code(engine: Engine) -> bool:
+    """Move `team_matches` from `team_id` to `team_code` (2026-09-06).
+
+    The table shipped keyed on teams.id, which is reassigned every season and
+    covers only the current 20 clubs. Dropping is safe and deliberate: no
+    backfill has run, so the table is empty, and preserving rows keyed on a
+    column that means different clubs in different seasons would preserve the
+    defect rather than the data.
+
+    Idempotent: does nothing once the table already has `team_code`.
+    """
+    inspector = inspect(engine)
+    if "team_matches" not in inspector.get_table_names():
+        return False
+    columns = {c["name"] for c in inspector.get_columns("team_matches")}
+    if "team_code" in columns:
+        return False
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE team_matches"))
+    logger.info("team_matches dropped; create_all will rebuild it keyed on team_code")
+    return True
+
+
 def drop_player_press_signals(engine: Engine) -> bool:
     """Drop ``player_press_signals``, retired 2026-09-06.
 
