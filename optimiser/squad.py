@@ -11,15 +11,6 @@ from optimiser.scoring import lambda_mu_for_risk_level, risk_adjusted_score
 
 logger = logging.getLogger(__name__)
 
-# Per-week XI variables multiply the binary count by the horizon, so an
-# unbounded solve is no longer a safe default (2026-09-06). CBC returns its
-# incumbent on timeout and PuLP reports the status as `Not Solved`; every
-# solve below already treats a non-`Optimal` status as a fallback trigger, so
-# a timeout needs no branch of its own. `transfers.py` declares a
-# `solver_time_limit` parameter but no caller passes one, so it is not the
-# working precedent it looks like.
-SOLVER_TIME_LIMIT_SECONDS = 120
-
 POSITIONS = ("GKP", "DEF", "MID", "FWD")
 
 SQUAD_COUNTS = {
@@ -42,6 +33,53 @@ STARTING_MAX = {
     "MID": SQUAD.starting_mid_max,
     "FWD": SQUAD.starting_fwd_max,
 }
+
+
+class SolverTimeout(RuntimeError):
+    """A solve stopped on its time limit rather than proving infeasibility.
+
+    Subclasses RuntimeError so every existing `except RuntimeError` keeps
+    working. The distinction matters because generate_squad_pool treats a
+    RuntimeError as "the cuts have exhausted the legal squads" and stops
+    quietly — which, for a timeout, silently returns a short pool.
+    """
+
+
+def _cbc(cfg: OptimiserConfig) -> pulp.PULP_CBC_CMD:
+    """CBC configured with the configured wall-clock limit.
+
+    A falsy ``solver_time_limit_seconds`` passes no ``timeLimit`` to
+    ``PULP_CBC_CMD`` at all -- CBC treats an explicit ``0`` as an immediate
+    stop rather than "no limit", so disabling the limit means omitting the
+    argument, not passing a zero value.
+    """
+    return pulp.PULP_CBC_CMD(msg=False, timeLimit=cfg.solver_time_limit_seconds or None)
+
+
+def _raise_if_not_optimal(status: str, cfg: OptimiserConfig, label: str) -> None:
+    """Raise on any non-Optimal CBC status (2026-09-07), distinguishing a
+    timeout from a genuinely infeasible problem.
+
+    CBC reports "Not Solved" when it stops on the time limit. That is NOT
+    the same as Infeasible, and must not be swallowed as one -- see
+    ``SolverTimeout``.
+    """
+    if status == "Optimal":
+        return
+    if status == "Not Solved":
+        logger.error(
+            "%s stopped on its %.0fs time limit; this is a timeout, not an "
+            "infeasible problem", label, cfg.solver_time_limit_seconds,
+        )
+        raise SolverTimeout(f"{label} stopped on its time limit ({status})")
+    raise RuntimeError(f"{label} did not find optimal solution: {status}")
+
+
+def _solve(prob: pulp.LpProblem, cfg: OptimiserConfig, label: str) -> None:
+    """Solve ``prob`` with CBC under the configured wall-clock limit, then
+    raise on any non-Optimal status. See ``_raise_if_not_optimal``."""
+    prob.solve(_cbc(cfg))
+    _raise_if_not_optimal(pulp.LpStatus[prob.status], cfg, label)
 
 
 @dataclass
@@ -142,7 +180,8 @@ def _per_week_scores(
     player_ids: list[int],
     horizon: int,
     decay: float,
-    cfg: OptimiserConfig,
+    lam: float,
+    mu: float,
     eo_by_pid: dict[int, float],
 ) -> dict[tuple[int, int], float]:
     """Risk-adjusted score per (player_id, week index), decayed by ``decay ** w``.
@@ -162,10 +201,13 @@ def _per_week_scores(
     per-week decayed scores also still sum to the collapsed one at any horizon
     whenever the XI does not move — the reformulation adds freedom, it does not
     re-weight anything.
+
+    ``lam``/``mu`` are taken as parameters, not recomputed here (2026-09-07):
+    ``optimise_squad`` also uses them for ``effective_score``, which drives the
+    scenario-based captain pick, and the two must agree or the ILP's captain
+    variable and ``scenario_based_captain`` would be answering different
+    questions.
     """
-    lam, mu = lambda_mu_for_risk_level(
-        cfg.risk_level, cfg.max_ownership_differential, cfg.mu_baseline, cfg.mu_range
-    )
     gws = sorted(projections["gameweek"].unique())[:horizon]
     # An empty projection frame still has to produce a solvable model, which is
     # what it produced before: one week, every coefficient zero.
@@ -351,6 +393,10 @@ def generate_squad_pool(
             solution = optimise_squad(
                 projections, players, forbidden_squads=forbidden, **kwargs
             )
+        except SolverTimeout:
+            # A timeout is not an exhausted pool. Propagating it means a caller
+            # sees a real failure instead of a silently short list of squads.
+            raise
         except RuntimeError:
             break
         pool.append(solution)
@@ -540,7 +586,7 @@ def optimise_squad(
     eo_by_pid = dict(zip(player_ids, df["eo_pct"], strict=True))
     # P3-3 risk-adjusted, now per (player, week); true xpts_total for reporting
     # is read straight off `df`/`starting_xi`.
-    scores_pw = _per_week_scores(projections, player_ids, horizon, decay, cfg, eo_by_pid)
+    scores_pw = _per_week_scores(projections, player_ids, horizon, decay, lam, mu, eo_by_pid)
 
     prob = pulp.LpProblem("fpl_squad", pulp.LpMaximize)
 
@@ -618,7 +664,7 @@ def optimise_squad(
                 prob += new_player[i] == selected[i]
         prob += pulp.lpSum(new_player) <= max_transfers
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_SECONDS))
+    prob.solve(_cbc(cfg))
 
     if pulp.LpStatus[prob.status] != "Optimal" and current_squad_ids and max_transfers is not None:
         prob2 = pulp.LpProblem("fpl_squad_fallback", pulp.LpMaximize)
@@ -665,7 +711,7 @@ def optimise_squad(
             if pid in idx:
                 prob2 += selected2[idx[pid]] == 1
         _add_no_good_cuts(prob2, selected2, idx, forbidden_squads)
-        prob2.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_SECONDS))
+        prob2.solve(_cbc(cfg))
         if pulp.LpStatus[prob2.status] == "Optimal":
             logger.warning(
                 "max_transfers=%d infeasible; falling back to unconstrained squad",
@@ -677,10 +723,7 @@ def optimise_squad(
             vice = vice2
             prob = prob2
 
-    if pulp.LpStatus[prob.status] != "Optimal":
-        raise RuntimeError(
-            f"ILP solver did not find optimal solution: {pulp.LpStatus[prob.status]}"
-        )
+    _raise_if_not_optimal(pulp.LpStatus[prob.status], cfg, "ILP solver")
 
     # Week 0 is what gets reported. `starting_xi`, `captain_id` and
     # `vice_captain_id` describe the gameweek about to be locked in — the only
@@ -865,10 +908,7 @@ def optimise_starting_xi(
         prob += vice[i] <= starting[i]
         prob += captain[i] + vice[i] <= 1
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_SECONDS))
-
-    if pulp.LpStatus[prob.status] != "Optimal":
-        raise RuntimeError(f"Starting XI solver failed: {pulp.LpStatus[prob.status]}")
+    _solve(prob, cfg, "Starting XI solver")
 
     starting_ids = {player_ids[i] for i in range(n) if pulp.value(starting[i]) > 0.5}
     captain_id = next(player_ids[i] for i in range(n) if pulp.value(captain[i]) > 0.5)

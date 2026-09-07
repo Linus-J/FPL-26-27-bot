@@ -446,6 +446,13 @@ class OptimiserConfig:
     # Minimum P(starts) threshold — players below this are excluded
     min_start_probability: float = 0.4
 
+    # Wall-clock ceiling on a single CBC solve (2026-09-07). Per-week XI
+    # variables multiply the binary count by the horizon, so an unbounded solve
+    # is no longer a safe default. Measured headroom is large — 2.8s at H=5 on
+    # the live 562-player frame — so this exists to bound a pathological case,
+    # not to bite in normal operation. 0 disables the limit entirely.
+    solver_time_limit_seconds: float = 120.0
+
     # hit_min_gain_buffer removed 2026-08-01 -- confirmed dead (found while
     # config-threading the simulation engine's persona knobs, never read by
     # optimiser/transfers.py), no test coverage.

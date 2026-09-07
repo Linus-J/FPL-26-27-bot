@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from optimiser.squad import optimise_squad_joint
+from optimiser.squad import SolverTimeout, optimise_squad_joint
 from optimiser.transfers import (
     TransferPlan,
     evaluate_transfers,
@@ -225,6 +225,11 @@ def build_free_hit_option(
             ownership=ownership,
             config=config,
         )
+    except SolverTimeout:
+        # Dropping the Free Hit option because a solve ran out of time would be
+        # invisible in the decision log; a real failure is better than a
+        # silently narrower comparison.
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("chip comparison: free hit option did not solve (%s)", exc)
         return None
