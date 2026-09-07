@@ -6,6 +6,7 @@ import pandas as pd
 import pulp
 
 from config.strategy import OPTIMISER, SQUAD, OptimiserConfig
+from optimiser.bench_weights import derive_gk_weight, derive_slot_weights
 from optimiser.captaincy import scenario_based_captain
 from optimiser.scoring import lambda_mu_for_risk_level, risk_adjusted_score
 
@@ -588,219 +589,280 @@ def optimise_squad(
     # is read straight off `df`/`starting_xi`.
     scores_pw = _per_week_scores(projections, player_ids, horizon, decay, lam, mu, eo_by_pid)
 
-    prob = pulp.LpProblem("fpl_squad", pulp.LpMaximize)
+    def _solve_once(cfg: OptimiserConfig) -> SquadSolution:
+        """One full solve (plus its own ``max_transfers`` fallback) under ``cfg``.
 
-    selected = [pulp.LpVariable(f"sel_{i}", cat="Binary") for i in range(n)]
-    starting = {
-        (i, w): pulp.LpVariable(f"sta_{i}_{w}", cat="Binary")
-        for i in range(n) for w in range(weeks)
-    }
-    captain = {
-        (i, w): pulp.LpVariable(f"cap_{i}_{w}", cat="Binary")
-        for i in range(n) for w in range(weeks)
-    }
-    vice = {
-        (i, w): pulp.LpVariable(f"vic_{i}_{w}", cat="Binary")
-        for i in range(n) for w in range(weeks)
-    }
+        Everything computed above this closure -- ``df``, ``scores_pw``,
+        ``lam``/``mu``, ``player_ids`` and so on -- does not depend on the
+        fields the bench-weight fixed-point loop below mutates
+        (``bench_slot_weights``, ``bench_gk_weight``), so it is computed once
+        outside rather than recomputed on every iteration.
+        """
+        prob = pulp.LpProblem("fpl_squad", pulp.LpMaximize)
 
-    # 2026-07-30: a bench player used to contribute nothing to the objective
-    # (only starting[i]/captain[i] did), so the solver had no reason to pick
-    # anything but the cheapest feasible fodder once the starting XI was
-    # set. `selected[i] - starting[i]` is 1 exactly when a player is on the
-    # bench, so this adds a fractional (bench_value_weight) share of their
-    # own score — real insurance value against an unpredicted blank in the
-    # XI — without letting bench quality compete with the starting XI for
-    # budget on equal terms.
-    prob += _xi_objective(
-        selected, starting, captain, vice, scores_pw, player_ids, weeks, cfg
-    ) + _bench_objective(
-        prob, selected, starting, scores_pw, player_ids, positions, weeks, cfg, "a"
-    )
-
-    # Squad-level constraints. These stay on the single horizon-wide
-    # `selected` — you own one fifteen for the whole plan, and duplicating
-    # these per week would let the solver imagine a squad that changes shape
-    # between gameweeks without a transfer.
-    prob += pulp.lpSum(selected) == SQUAD.squad_size
-    prob += pulp.lpSum(costs[i] * selected[i] for i in range(n)) <= budget
-
-    for pos in POSITIONS:
-        pos_idx = [i for i, p in enumerate(positions) if p == pos]
-        prob += pulp.lpSum(selected[i] for i in pos_idx) == SQUAD_COUNTS[pos]
-
-    team_ids = list(set(teams))
-    for tid in team_ids:
-        team_idx = [i for i, t in enumerate(teams) if t == tid]
-        prob += pulp.lpSum(selected[i] for i in team_idx) <= SQUAD.max_players_per_club
-
-    # XI-shape constraints, one copy per week.
-    for w in range(weeks):
-        prob += pulp.lpSum(starting[(i, w)] for i in range(n)) == 11
-        prob += pulp.lpSum(captain[(i, w)] for i in range(n)) == 1
-        prob += pulp.lpSum(vice[(i, w)] for i in range(n)) == 1
-        for pos in POSITIONS:
-            pos_idx = [i for i, p in enumerate(positions) if p == pos]
-            prob += pulp.lpSum(starting[(i, w)] for i in pos_idx) >= STARTING_MIN[pos]
-            prob += pulp.lpSum(starting[(i, w)] for i in pos_idx) <= STARTING_MAX[pos]
-        for i in range(n):
-            prob += starting[(i, w)] <= selected[i]
-            prob += captain[(i, w)] <= starting[(i, w)]
-            prob += vice[(i, w)] <= starting[(i, w)]
-            prob += captain[(i, w)] + vice[(i, w)] <= 1
-
-    for pid in force_include_ids:
-        if pid in idx:
-            prob += selected[idx[pid]] == 1
-
-    _add_no_good_cuts(prob, selected, idx, forbidden_squads)
-
-    if current_squad_ids and max_transfers is not None:
-        new_player = [pulp.LpVariable(f"new_{i}", cat="Binary") for i in range(n)]
-        for i, pid in enumerate(player_ids):
-            if pid in in_squad:
-                prob += new_player[i] == 0
-            else:
-                prob += new_player[i] == selected[i]
-        prob += pulp.lpSum(new_player) <= max_transfers
-
-    prob.solve(_cbc(cfg))
-
-    if pulp.LpStatus[prob.status] != "Optimal" and current_squad_ids and max_transfers is not None:
-        prob2 = pulp.LpProblem("fpl_squad_fallback", pulp.LpMaximize)
-        selected2 = [pulp.LpVariable(f"sel2_{i}", cat="Binary") for i in range(n)]
-        starting2 = {
-            (i, w): pulp.LpVariable(f"sta2_{i}_{w}", cat="Binary")
+        selected = [pulp.LpVariable(f"sel_{i}", cat="Binary") for i in range(n)]
+        starting = {
+            (i, w): pulp.LpVariable(f"sta_{i}_{w}", cat="Binary")
             for i in range(n) for w in range(weeks)
         }
-        captain2 = {
-            (i, w): pulp.LpVariable(f"cap2_{i}_{w}", cat="Binary")
+        captain = {
+            (i, w): pulp.LpVariable(f"cap_{i}_{w}", cat="Binary")
             for i in range(n) for w in range(weeks)
         }
-        vice2 = {
-            (i, w): pulp.LpVariable(f"vic2_{i}_{w}", cat="Binary")
+        vice = {
+            (i, w): pulp.LpVariable(f"vic_{i}_{w}", cat="Binary")
             for i in range(n) for w in range(weeks)
         }
-        prob2 += _xi_objective(
-            selected2, starting2, captain2, vice2, scores_pw, player_ids, weeks, cfg
+
+        # 2026-07-30: a bench player used to contribute nothing to the objective
+        # (only starting[i]/captain[i] did), so the solver had no reason to pick
+        # anything but the cheapest feasible fodder once the starting XI was
+        # set. `selected[i] - starting[i]` is 1 exactly when a player is on the
+        # bench, so this adds a fractional (bench_value_weight) share of their
+        # own score — real insurance value against an unpredicted blank in the
+        # XI — without letting bench quality compete with the starting XI for
+        # budget on equal terms.
+        prob += _xi_objective(
+            selected, starting, captain, vice, scores_pw, player_ids, weeks, cfg
         ) + _bench_objective(
-            prob2, selected2, starting2, scores_pw, player_ids, positions, weeks, cfg, "b"
+            prob, selected, starting, scores_pw, player_ids, positions, weeks, cfg, "a"
         )
-        prob2 += pulp.lpSum(selected2) == SQUAD.squad_size
-        prob2 += pulp.lpSum(costs[i] * selected2[i] for i in range(n)) <= budget
+
+        # Squad-level constraints. These stay on the single horizon-wide
+        # `selected` — you own one fifteen for the whole plan, and duplicating
+        # these per week would let the solver imagine a squad that changes shape
+        # between gameweeks without a transfer.
+        prob += pulp.lpSum(selected) == SQUAD.squad_size
+        prob += pulp.lpSum(costs[i] * selected[i] for i in range(n)) <= budget
+
         for pos in POSITIONS:
             pos_idx = [i for i, p in enumerate(positions) if p == pos]
-            prob2 += pulp.lpSum(selected2[i] for i in pos_idx) == SQUAD_COUNTS[pos]
-        for tid in list(set(teams)):
+            prob += pulp.lpSum(selected[i] for i in pos_idx) == SQUAD_COUNTS[pos]
+
+        team_ids = list(set(teams))
+        for tid in team_ids:
             team_idx = [i for i, t in enumerate(teams) if t == tid]
-            prob2 += pulp.lpSum(selected2[i] for i in team_idx) <= SQUAD.max_players_per_club
+            prob += pulp.lpSum(selected[i] for i in team_idx) <= SQUAD.max_players_per_club
+
+        # XI-shape constraints, one copy per week.
         for w in range(weeks):
-            prob2 += pulp.lpSum(starting2[(i, w)] for i in range(n)) == 11
-            prob2 += pulp.lpSum(captain2[(i, w)] for i in range(n)) == 1
-            prob2 += pulp.lpSum(vice2[(i, w)] for i in range(n)) == 1
+            prob += pulp.lpSum(starting[(i, w)] for i in range(n)) == 11
+            prob += pulp.lpSum(captain[(i, w)] for i in range(n)) == 1
+            prob += pulp.lpSum(vice[(i, w)] for i in range(n)) == 1
             for pos in POSITIONS:
                 pos_idx = [i for i, p in enumerate(positions) if p == pos]
-                prob2 += pulp.lpSum(starting2[(i, w)] for i in pos_idx) >= STARTING_MIN[pos]
-                prob2 += pulp.lpSum(starting2[(i, w)] for i in pos_idx) <= STARTING_MAX[pos]
+                prob += pulp.lpSum(starting[(i, w)] for i in pos_idx) >= STARTING_MIN[pos]
+                prob += pulp.lpSum(starting[(i, w)] for i in pos_idx) <= STARTING_MAX[pos]
             for i in range(n):
-                prob2 += starting2[(i, w)] <= selected2[i]
-                prob2 += captain2[(i, w)] <= starting2[(i, w)]
-                prob2 += vice2[(i, w)] <= starting2[(i, w)]
-                prob2 += captain2[(i, w)] + vice2[(i, w)] <= 1
+                prob += starting[(i, w)] <= selected[i]
+                prob += captain[(i, w)] <= starting[(i, w)]
+                prob += vice[(i, w)] <= starting[(i, w)]
+                prob += captain[(i, w)] + vice[(i, w)] <= 1
+
         for pid in force_include_ids:
             if pid in idx:
-                prob2 += selected2[idx[pid]] == 1
-        _add_no_good_cuts(prob2, selected2, idx, forbidden_squads)
-        prob2.solve(_cbc(cfg))
-        if pulp.LpStatus[prob2.status] == "Optimal":
-            logger.warning(
-                "max_transfers=%d infeasible; falling back to unconstrained squad",
-                max_transfers,
-            )
-            selected = selected2
-            starting = starting2
-            captain = captain2
-            vice = vice2
-            prob = prob2
+                prob += selected[idx[pid]] == 1
 
-    _raise_if_not_optimal(pulp.LpStatus[prob.status], cfg, "ILP solver")
+        _add_no_good_cuts(prob, selected, idx, forbidden_squads)
 
-    # Week 0 is what gets reported. `starting_xi`, `captain_id` and
-    # `vice_captain_id` describe the gameweek about to be locked in — the only
-    # one any caller can act on — and every later week exists so that the
-    # squad is chosen knowing what it will be able to do with them.
-    selected_ids = {player_ids[i] for i in range(n) if pulp.value(selected[i]) > 0.5}
-    starting_ids = {player_ids[i] for i in range(n) if pulp.value(starting[(i, 0)]) > 0.5}
-    captain_id = next(player_ids[i] for i in range(n) if pulp.value(captain[(i, 0)]) > 0.5)
-    vice_id = next(player_ids[i] for i in range(n) if pulp.value(vice[(i, 0)]) > 0.5)
+        if current_squad_ids and max_transfers is not None:
+            new_player = [pulp.LpVariable(f"new_{i}", cat="Binary") for i in range(n)]
+            for i, pid in enumerate(player_ids):
+                if pid in in_squad:
+                    prob += new_player[i] == 0
+                else:
+                    prob += new_player[i] == selected[i]
+            prob += pulp.lpSum(new_player) <= max_transfers
 
-    if season is not None and target_gw is not None:
-        # The decayed figure, matching the ILP's own captain variable, which
-        # ranks on `effective_score`. If these two disagreed the linear argmax
-        # inside the solve and the scenario-based pick after it would be
-        # answering different questions.
-        xpts_by_id = dict(zip(df["id"], df["xpts_objective"], strict=True))
-        var_by_id = dict(zip(df["id"], df["var_total"], strict=True))
-        captain_id = scenario_based_captain(
-            season, target_gw, list(starting_ids), xpts_by_id, var_by_id, mu,
-            semidev_by_id=_semidev_by_id(df, mu),
+        prob.solve(_cbc(cfg))
+
+        needs_fallback = (
+            pulp.LpStatus[prob.status] != "Optimal"
+            and current_squad_ids
+            and max_transfers is not None
         )
-        if captain_id == vice_id:
-            remaining = [pid for pid in starting_ids if pid != captain_id]
-            vice_id = max(remaining, key=lambda pid: xpts_by_id.get(pid, 0.0))
+        if needs_fallback:
+            prob2 = pulp.LpProblem("fpl_squad_fallback", pulp.LpMaximize)
+            selected2 = [pulp.LpVariable(f"sel2_{i}", cat="Binary") for i in range(n)]
+            starting2 = {
+                (i, w): pulp.LpVariable(f"sta2_{i}_{w}", cat="Binary")
+                for i in range(n) for w in range(weeks)
+            }
+            captain2 = {
+                (i, w): pulp.LpVariable(f"cap2_{i}_{w}", cat="Binary")
+                for i in range(n) for w in range(weeks)
+            }
+            vice2 = {
+                (i, w): pulp.LpVariable(f"vic2_{i}_{w}", cat="Binary")
+                for i in range(n) for w in range(weeks)
+            }
+            prob2 += _xi_objective(
+                selected2, starting2, captain2, vice2, scores_pw, player_ids, weeks, cfg
+            ) + _bench_objective(
+                prob2, selected2, starting2, scores_pw, player_ids, positions, weeks, cfg, "b"
+            )
+            prob2 += pulp.lpSum(selected2) == SQUAD.squad_size
+            prob2 += pulp.lpSum(costs[i] * selected2[i] for i in range(n)) <= budget
+            for pos in POSITIONS:
+                pos_idx = [i for i, p in enumerate(positions) if p == pos]
+                prob2 += pulp.lpSum(selected2[i] for i in pos_idx) == SQUAD_COUNTS[pos]
+            for tid in list(set(teams)):
+                team_idx = [i for i, t in enumerate(teams) if t == tid]
+                prob2 += pulp.lpSum(selected2[i] for i in team_idx) <= SQUAD.max_players_per_club
+            for w in range(weeks):
+                prob2 += pulp.lpSum(starting2[(i, w)] for i in range(n)) == 11
+                prob2 += pulp.lpSum(captain2[(i, w)] for i in range(n)) == 1
+                prob2 += pulp.lpSum(vice2[(i, w)] for i in range(n)) == 1
+                for pos in POSITIONS:
+                    pos_idx = [i for i, p in enumerate(positions) if p == pos]
+                    prob2 += pulp.lpSum(starting2[(i, w)] for i in pos_idx) >= STARTING_MIN[pos]
+                    prob2 += pulp.lpSum(starting2[(i, w)] for i in pos_idx) <= STARTING_MAX[pos]
+                for i in range(n):
+                    prob2 += starting2[(i, w)] <= selected2[i]
+                    prob2 += captain2[(i, w)] <= starting2[(i, w)]
+                    prob2 += vice2[(i, w)] <= starting2[(i, w)]
+                    prob2 += captain2[(i, w)] + vice2[(i, w)] <= 1
+            for pid in force_include_ids:
+                if pid in idx:
+                    prob2 += selected2[idx[pid]] == 1
+            _add_no_good_cuts(prob2, selected2, idx, forbidden_squads)
+            prob2.solve(_cbc(cfg))
+            if pulp.LpStatus[prob2.status] == "Optimal":
+                logger.warning(
+                    "max_transfers=%d infeasible; falling back to unconstrained squad",
+                    max_transfers,
+                )
+                selected = selected2
+                starting = starting2
+                captain = captain2
+                vice = vice2
+                prob = prob2
 
-    squad_df = df[df["id"].isin(selected_ids)].copy()
-    squad_df["is_starting"] = squad_df["id"].isin(starting_ids)
-    squad_df["is_captain"] = squad_df["id"] == captain_id
-    squad_df["is_vice_captain"] = squad_df["id"] == vice_id
+        _raise_if_not_optimal(pulp.LpStatus[prob.status], cfg, "ILP solver")
 
-    bench = squad_df[~squad_df["is_starting"]].copy()
-    bench = bench.sort_values(
-        ["position", "xpts_total"],
-        key=lambda s: (
-            s.map({"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}) if s.name == "position" else -s
-        ),
-        ascending=[True, True],
-    )
-    bench_order = {pid: i for i, pid in enumerate(bench["id"])}
-    squad_df["bench_order"] = squad_df["id"].map(bench_order).fillna(-1).astype(int)
+        # Week 0 is what gets reported. `starting_xi`, `captain_id` and
+        # `vice_captain_id` describe the gameweek about to be locked in — the only
+        # one any caller can act on — and every later week exists so that the
+        # squad is chosen knowing what it will be able to do with them.
+        selected_ids = {player_ids[i] for i in range(n) if pulp.value(selected[i]) > 0.5}
+        starting_ids = {player_ids[i] for i in range(n) if pulp.value(starting[(i, 0)]) > 0.5}
+        captain_id = next(player_ids[i] for i in range(n) if pulp.value(captain[(i, 0)]) > 0.5)
+        vice_id = next(player_ids[i] for i in range(n) if pulp.value(vice[(i, 0)]) > 0.5)
 
-    starting_xi = squad_df[squad_df["is_starting"]].copy()
+        if season is not None and target_gw is not None:
+            # The decayed figure, matching the ILP's own captain variable, which
+            # ranks on `effective_score`. If these two disagreed the linear argmax
+            # inside the solve and the scenario-based pick after it would be
+            # answering different questions.
+            xpts_by_id = dict(zip(df["id"], df["xpts_objective"], strict=True))
+            var_by_id = dict(zip(df["id"], df["var_total"], strict=True))
+            captain_id = scenario_based_captain(
+                season, target_gw, list(starting_ids), xpts_by_id, var_by_id, mu,
+                semidev_by_id=_semidev_by_id(df, mu),
+            )
+            if captain_id == vice_id:
+                remaining = [pid for pid in starting_ids if pid != captain_id]
+                vice_id = max(remaining, key=lambda pid: xpts_by_id.get(pid, 0.0))
 
-    if current_squad_ids:
-        incoming = selected_ids - in_squad
-        transfers_made = len(incoming)
-        hits = max(0, transfers_made - free_transfers)
-    else:
-        hits = 0
+        squad_df = df[df["id"].isin(selected_ids)].copy()
+        squad_df["is_starting"] = squad_df["id"].isin(starting_ids)
+        squad_df["is_captain"] = squad_df["id"] == captain_id
+        squad_df["is_vice_captain"] = squad_df["id"] == vice_id
 
-    # TRUE expected points (P3-3: the ILP's own objective value is now the
-    # risk-adjusted `scores`, not real xpts — report the real figure,
-    # computed straight from the starting XI + captain bonus).
-    total_xpts = float(
-        starting_xi["xpts_total"].sum()
-        + starting_xi.loc[starting_xi["id"] == captain_id, "xpts_total"].sum()
-    )
-    total_cost = float(sum(
-        df.loc[df["id"] == pid, "now_cost"].values[0]
-        for pid in selected_ids
-    ))
+        bench = squad_df[~squad_df["is_starting"]].copy()
+        bench = bench.sort_values(
+            ["position", "xpts_total"],
+            key=lambda s: (
+                s.map({"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}) if s.name == "position" else -s
+            ),
+            ascending=[True, True],
+        )
+        bench_order = {pid: i for i, pid in enumerate(bench["id"])}
+        squad_df["bench_order"] = squad_df["id"].map(bench_order).fillna(-1).astype(int)
 
-    logger.info(
-        "Squad optimised: xPts=%.2f cost=£%.1fm hits=%d captain=%s",
-        total_xpts, total_cost, hits,
-        df.loc[df["id"] == captain_id, "web_name"].values[0],
-    )
+        starting_xi = squad_df[squad_df["is_starting"]].copy()
 
-    return SquadSolution(
-        squad=squad_df,
-        starting_xi=starting_xi,
-        captain_id=captain_id,
-        vice_captain_id=vice_id,
-        total_xpts=total_xpts,
-        total_cost=total_cost,
-        hits_taken=hits,
-    )
+        if current_squad_ids:
+            incoming = selected_ids - in_squad
+            transfers_made = len(incoming)
+            hits = max(0, transfers_made - free_transfers)
+        else:
+            hits = 0
+
+        # TRUE expected points (P3-3: the ILP's own objective value is now the
+        # risk-adjusted `scores`, not real xpts — report the real figure,
+        # computed straight from the starting XI + captain bonus).
+        total_xpts = float(
+            starting_xi["xpts_total"].sum()
+            + starting_xi.loc[starting_xi["id"] == captain_id, "xpts_total"].sum()
+        )
+        total_cost = float(sum(
+            df.loc[df["id"] == pid, "now_cost"].values[0]
+            for pid in selected_ids
+        ))
+
+        logger.info(
+            "Squad optimised: xPts=%.2f cost=£%.1fm hits=%d captain=%s",
+            total_xpts, total_cost, hits,
+            df.loc[df["id"] == captain_id, "web_name"].values[0],
+        )
+
+        return SquadSolution(
+            squad=squad_df,
+            starting_xi=starting_xi,
+            captain_id=captain_id,
+            vice_captain_id=vice_id,
+            total_xpts=total_xpts,
+            total_cost=total_cost,
+            hits_taken=hits,
+        )
+
+    solution = _solve_once(cfg)
+
+    # Fixed point on the bench weights (2026-09-06). The weights depend on the
+    # XI and the XI depends on the weights, so solve, re-derive, re-solve.
+    # Converges in one or two rounds in practice because the XI is stable under
+    # a small change in bench pricing; the cap bounds the worst case.
+    #
+    # Named `_solve_once` here rather than `_solve`, which the brief sketched:
+    # a module-level `_solve(prob, cfg, label)` already exists in this file
+    # (used by `optimise_starting_xi`) for a different purpose, and a nested
+    # function of the same name would silently shadow it for the rest of this
+    # function -- confusing to anyone grepping the file, even though nothing
+    # here actually calls the module-level one.
+    if cfg.derive_bench_weights_per_solve:
+        if "start_probability" not in players.columns:
+            logger.warning(
+                "derive_bench_weights_per_solve is set but `players` has no "
+                "start_probability column; skipping the fixed-point pass"
+            )
+        else:
+            positions_by_id = dict(zip(df["id"], df["position"], strict=True))
+            probs = players.set_index("id")["start_probability"]
+            previous_xi: set[int] | None = None
+            for _ in range(cfg.bench_weight_fixed_point_iterations):
+                xi_ids = set(solution.starting_xi["id"])
+                if xi_ids == previous_xi:
+                    break
+                previous_xi = xi_ids
+                outfield = [
+                    float(probs.get(pid, 0.9))
+                    for pid in xi_ids
+                    if positions_by_id.get(pid) != "GKP"
+                ]
+                keepers = [
+                    float(probs.get(pid, 0.9))
+                    for pid in xi_ids
+                    if positions_by_id.get(pid) == "GKP"
+                ]
+                cfg = dataclasses.replace(
+                    cfg,
+                    bench_slot_weights=derive_slot_weights(outfield),
+                    bench_gk_weight=derive_gk_weight(keepers[0] if keepers else 0.9),
+                )
+                solution = _solve_once(cfg)
+
+    return solution
 
 
 def optimise_starting_xi(

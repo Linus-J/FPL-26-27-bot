@@ -655,6 +655,26 @@ class OptimiserConfig:
     # implies much the same.
     bench_gk_weight: float = 0.03
 
+    # Recompute the slot weights above from the XI the solver actually picks,
+    # instead of using the static tuple (2026-09-06).
+    #
+    # The static values were derived once from the live GW1 XI (mean P(start)
+    # 0.93) and never recomputed, so they are wrong for any other squad and
+    # wrong in the direction that matters -- a fragile XI needs a fatter slot 1
+    # and gets the same 0.53. `docs/bench-and-correlation-research-2026-08-18.md`
+    # names this as the known gap and FPLReview's solver as precedent.
+    #
+    # Circular by nature (the weights depend on the XI, which depends on the
+    # weights), so the caller runs a short fixed-point pass. False reproduces
+    # the pre-2026-09-06 behaviour exactly, which is what makes the change
+    # measurable rather than assumed.
+    derive_bench_weights_per_solve: bool = False
+
+    # Iterations of that fixed-point pass. Two is almost always enough: the
+    # first re-solve moves the XI, the second confirms it. Bounded because each
+    # iteration is a full ILP solve.
+    bench_weight_fixed_point_iterations: int = 3
+
 
 # ---------------------------------------------------------------------------
 # DEPARTURE RISK (v2-build-plan §6.5) — squad-construction gate, LIVE from the
