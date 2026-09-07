@@ -85,3 +85,15 @@ def test_every_row_carries_the_season_it_was_ingested_for():
         season="2021-22", competition="PL",
     )
     assert all(r["season"] == "2021-22" for r in out)
+
+
+def test_leagues_are_registered_before_soccerdata_is_imported():
+    """soccerdata caches league_dict.json at import, so registering afterwards
+    writes a file the process will never re-read -- which is why every European
+    job failed with 'Invalid league' on the first live backfill."""
+    import inspect
+
+    from data.ingestors import team_matches
+
+    src = inspect.getsource(team_matches.ingest_competition_season)
+    assert src.index("register_leagues()") < src.index("import soccerdata")

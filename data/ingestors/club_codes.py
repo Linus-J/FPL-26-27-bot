@@ -37,7 +37,7 @@ _RAW: dict[int, tuple[str, ...]] = {
     11: ("Everton",),
     13: ("Leicester City", "Leicester"),
     14: ("Liverpool",),
-    17: ("Nott'ham Forest", "Nottingham Forest", "Nott'm Forest", "Notts Forest"),
+    17: ("Nott'ham Forest", "Nottingham Forest", "Nott'm Forest", "Notts Forest", "Nottingham"),
     20: ("Southampton",),
     21: ("West Ham United", "West Ham"),
     31: ("Crystal Palace",),

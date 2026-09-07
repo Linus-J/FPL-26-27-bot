@@ -110,9 +110,14 @@ def ingest_competition_season(season: str, league: str) -> int:  # pragma: no co
     ``league`` is a soccerdata league id, e.g. ``"INT-Champions League"``.
     Excluded from coverage: needs live network and a real browser.
     """
+    # BEFORE the import: soccerdata reads league_dict.json at import time, so
+    # registering afterwards writes a file this process will never re-read --
+    # which made every European job fail with "Invalid league" on the first
+    # live backfill.
+    register_leagues()
+
     import soccerdata as sd
 
-    register_leagues()
     competition = COMPETITIONS[league]
     fbref = sd.FBref(leagues=league, seasons=season)
     schedule = fbref.read_schedule().reset_index()

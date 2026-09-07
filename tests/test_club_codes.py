@@ -55,6 +55,12 @@ def test_an_unknown_club_resolves_to_none():
     assert resolve_club("Bayern Munich") is None
 
 
+def test_fbrefs_bare_nottingham_resolves_to_forest():
+    """FBref writes the club as "Nottingham", not "Nott'ham Forest". Every
+    Premier League season from 2022-23 on failed the live backfill on this."""
+    assert resolve_club("Nottingham") == 17
+
+
 @pytest.mark.skipif(not _LIVE_DB.exists(), reason="requires the live fpl_bot_v2.db")
 def test_every_code_in_the_live_registry_has_a_name():
     """The table must cover every club team_season_strength knows about, or the
