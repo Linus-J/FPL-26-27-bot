@@ -130,7 +130,7 @@ def _load_squad_state(
             # are at most two Free Hits in a season -- while still bounding
             # the read.
             query = text("""
-                SELECT details FROM sim_decision_log
+                SELECT gameweek, details FROM sim_decision_log
                 WHERE sim_manager_id = :sim_manager_id AND decision_type = 'lineup'
                   AND (:decided_gw IS NULL OR gameweek < :decided_gw)
                 ORDER BY created_at DESC LIMIT 50
@@ -140,7 +140,7 @@ def _load_squad_state(
             ).fetchall()
         else:
             query = text("""
-                SELECT dl.details
+                SELECT dl.gameweek, dl.details
                 FROM decision_log dl
                 WHERE dl.decision_type = 'lineup'
                   AND (:decided_gw IS NULL OR dl.gameweek < :decided_gw)
@@ -154,7 +154,7 @@ def _load_squad_state(
     if not rows:
         return SquadState([], SQUAD.budget_total, 1, 0.0, {})
 
-    latest = json.loads(rows[0][0])
+    latest = json.loads(rows[0][1])
     budget = latest.get("budget", SQUAD.budget_total)
     free_transfers = latest.get("free_transfers", 1)
     # JSON object keys are strings; the rest of the engine keys players by
@@ -165,19 +165,36 @@ def _load_squad_state(
     }
     bank = latest.get("bank")
 
-    # squad_ids ONLY comes from the most recent non-Free-Hit lineup. A Free
-    # Hit squad is handed back at the deadline, so it is never what we own
-    # next week -- the engine used to believe it was, and planned transfers
-    # selling players it did not own (live, GW4 2026-27).
+    # A gameweek is decided many times: the engine is re-run interactively
+    # before each deadline and every run appends a lineup row. Only the LAST
+    # row for a gameweek is the decision that stands -- earlier ones are
+    # superseded alternatives, and some explored a different chip branch
+    # entirely. Collapsing to one row per gameweek BEFORE the free-hit
+    # walk-back is what stops it landing on a superseded no-chip run from the
+    # same week the free hit was actually played (live: GW3 2026-27, where the
+    # walk-back returned a squad containing two players the manager never
+    # owned).
+    final_by_gw: dict[int, dict] = {}
+    for gw, raw in rows:  # newest first
+        if gw not in final_by_gw:
+            final_by_gw[gw] = json.loads(raw)
+
+    # squad_ids ONLY comes from the most recent gameweek whose FINAL decision
+    # was not a Free Hit. A Free Hit squad is handed back at the deadline, so
+    # it is never what we own next week -- the engine used to believe it was,
+    # and planned transfers selling players it did not own (live, GW4
+    # 2026-27).
     #
-    # A WILDCARD squad genuinely persists, so wildcard rows are not skipped.
+    # A WILDCARD squad genuinely persists, so wildcard gameweeks are not
+    # skipped.
     #
     # Everything else -- bank, free transfers, purchase prices -- is already
     # carried correctly across a Free Hit by the settle step, so it comes
-    # from the latest row whatever chip that row played (above).
+    # from the latest row overall whatever chip that row played (above),
+    # not from this per-gameweek collapse.
     squad_ids: list[int] = []
-    for (raw,) in rows:
-        details = json.loads(raw)
+    for gw in sorted(final_by_gw, reverse=True):
+        details = final_by_gw[gw]
         if details.get("chip_considered") == Chip.FREE_HIT.value:
             continue
         squad_ids = details.get("squad_ids", [])
