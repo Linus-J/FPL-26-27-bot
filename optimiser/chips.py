@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from config.strategy import CHIP_TIMING, CHIPS, ChipTimingThresholds, OptimiserConfig
 from data.db import get_session
+from optimiser.bench_boost import select_bb_target_gw, should_hold_bench_boost
 from optimiser.chip_comparison import ChipComparison
 from optimiser.chip_scenarios import gain_distribution, load_scenario_totals
 from optimiser.squad import optimise_squad
@@ -476,6 +477,23 @@ def recommend_chip(
             bench_xpts, threshold, bb_scenarios, timing.bench_boost_min_payoff_probability
         ):
             return None
+        # Hold for a better week inside the window (2026-09-06). Until now this
+        # only ever examined the CURRENT gameweek, so there was no target to
+        # build toward and no reason to wait -- _try_tc has had
+        # dgw_visible_ahead for the same question since it was written.
+        if not force and current_squad_ids is not None:
+            target = select_bb_target_gw(
+                current_squad_ids, projections, current_gw, threshold
+            )
+            if should_hold_bench_boost(
+                current_gw, bench_xpts, target, timing.bench_boost_hold_margin_xpts
+            ):
+                logger.info(
+                    "BB held: GW%d bench worth %.2f beats GW%d's %.2f by more than %.2f",
+                    target[0], target[1], current_gw, bench_xpts,
+                    timing.bench_boost_hold_margin_xpts,
+                )
+                return None
         context = "DGW " if dgw_active_now else ""
         logger.info("BB recommended: bench_xpts=%.2f at GW%d", bench_xpts, current_gw)
         return ChipRecommendation(

@@ -89,3 +89,24 @@ def select_bb_target_gw(
         )
         return None
     return best_gw, totals[best_gw]
+
+
+def should_hold_bench_boost(
+    current_gw: int,
+    current_bench: float,
+    target: tuple[int, float] | None,
+    margin: float,
+) -> bool:
+    """Should the chip be held back for a better week inside the window?
+
+    True only when the target is strictly ahead of `current_gw` and beats this
+    week by more than `margin`. A margin rather than a bare argmax because
+    projections a few weeks out are mostly strength-model output: without one,
+    ordinary noise would defer the chip week after week until it expired.
+    """
+    if target is None:
+        return False
+    target_gw, target_bench = target
+    if target_gw <= current_gw:
+        return False
+    return (target_bench - current_bench) > margin
