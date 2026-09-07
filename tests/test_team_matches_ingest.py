@@ -12,6 +12,10 @@ def _schedule(rows: list[tuple]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["date", "home_team", "away_team"])
 
 
+def _schedule_with_time(rows: list[tuple]) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=["date", "time", "home_team", "away_team"])
+
+
 def test_a_domestic_match_produces_one_row_per_club():
     out = build_team_rows(
         _schedule([(datetime(2025, 10, 4, 15, 0), "Arsenal", "Liverpool")]),
@@ -85,6 +89,42 @@ def test_every_row_carries_the_season_it_was_ingested_for():
         season="2021-22", competition="PL",
     )
     assert all(r["season"] == "2021-22" for r in out)
+
+
+def test_the_kickoff_time_comes_from_the_date_and_time_columns():
+    """FBref's date column is date-only. Reading it alone put every kickoff at
+    midnight, which silently turned rest-days into calendar-date subtraction --
+    the exact thing projection/congestion.py's tests exist to prevent."""
+    sched = _schedule_with_time([(datetime(2025, 10, 4), "20:00", "Arsenal", "Liverpool")])
+    out = build_team_rows(sched, season="2025-26", competition="PL")
+    assert out[0]["kickoff_time"] == datetime(2025, 10, 4, 20, 0)
+
+
+def test_a_parenthesised_european_time_uses_the_leading_value():
+    """European schedules carry '21:00 (20:00)'; the leading value is the
+    venue-local kickoff."""
+    sched = _schedule_with_time(
+        [(datetime(2025, 10, 1), "21:00 (20:00)", "Manchester City", "Real Madrid")]
+    )
+    out = build_team_rows(sched, season="2025-26", competition="UCL")
+    assert out[0]["kickoff_time"] == datetime(2025, 10, 1, 21, 0)
+
+
+def test_a_missing_time_falls_back_to_the_date_alone():
+    """A postponed or unscheduled fixture has no time. Keep the row -- the date
+    still carries real congestion signal -- rather than dropping the match."""
+    sched = _schedule_with_time([(datetime(2025, 10, 4), None, "Arsenal", "Liverpool")])
+    out = build_team_rows(sched, season="2025-26", competition="PL")
+    assert out[0]["kickoff_time"] == datetime(2025, 10, 4, 0, 0)
+
+
+def test_a_schedule_without_a_time_column_still_works():
+    """Defensive: the column's presence is FBref's choice, not ours."""
+    out = build_team_rows(
+        _schedule([(datetime(2025, 10, 4), "Arsenal", "Liverpool")]),
+        season="2025-26", competition="PL",
+    )
+    assert out[0]["kickoff_time"] == datetime(2025, 10, 4, 0, 0)
 
 
 def test_leagues_are_registered_before_soccerdata_is_imported():

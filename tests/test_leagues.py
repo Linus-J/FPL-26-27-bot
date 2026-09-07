@@ -62,6 +62,15 @@ def test_register_repairs_the_inherited_prior_league_entries(tmp_path, monkeypat
         assert name in written
 
 
+def test_the_european_fbref_names_match_what_the_site_publishes():
+    """Wrong names made read_leagues() return zero rows, and read_seasons()
+    then died on pd.concat([]) -- all 18 European backfill jobs failed with
+    'No objects to concatenate'."""
+    assert EUROPEAN_LEAGUES["INT-Champions League"]["FBref"] == "UEFA Champions League"
+    assert EUROPEAN_LEAGUES["INT-Europa League"]["FBref"] == "UEFA Europa League"
+    assert EUROPEAN_LEAGUES["INT-Conference League"]["FBref"] == "UEFA Conference League"
+
+
 def test_register_is_idempotent(tmp_path, monkeypatch):
     target = tmp_path / "league_dict.json"
     monkeypatch.setattr("data.ingestors.leagues._league_dict_path", lambda: target)

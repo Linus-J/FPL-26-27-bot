@@ -25,17 +25,17 @@ logger = logging.getLogger(__name__)
 # inside — the 2024-25 Champions League runs Sep 2024 to May 2025.
 EUROPEAN_LEAGUES: dict[str, dict] = {
     "INT-Champions League": {
-        "FBref": "Champions League",
+        "FBref": "UEFA Champions League",
         "season_start": "Aug",
         "season_end": "May",
     },
     "INT-Europa League": {
-        "FBref": "Europa League",
+        "FBref": "UEFA Europa League",
         "season_start": "Aug",
         "season_end": "May",
     },
     "INT-Conference League": {
-        "FBref": "Europa Conference League",
+        "FBref": "UEFA Conference League",
         "season_start": "Aug",
         "season_end": "May",
     },

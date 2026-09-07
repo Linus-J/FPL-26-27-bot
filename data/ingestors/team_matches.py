@@ -12,6 +12,7 @@ already depends on: FBref sits behind Cloudflare, which is why
 from __future__ import annotations
 
 import logging
+import re
 
 import pandas as pd
 from sqlalchemy.dialects.sqlite import insert
@@ -22,6 +23,29 @@ from data.ingestors.leagues import COMPETITIONS, register_leagues
 from data.models import TeamMatch
 
 logger = logging.getLogger(__name__)
+
+
+def _kickoff(date_value: object, time_value: object) -> pd.Timestamp | None:
+    """Combine FBref's date-only column with its separate time column.
+
+    Reading the date alone put every kickoff at midnight, which quietly
+    demotes rest-days to calendar-date subtraction — the precision this whole
+    feature is justified by. European schedules render the time as
+    "21:00 (20:00)"; the leading value is the venue-local kickoff.
+
+    A missing or unparseable time keeps the row at midnight rather than
+    dropping it: the date still carries real congestion signal, and a dropped
+    match would read as REST.
+    """
+    date = pd.to_datetime(date_value, errors="coerce")
+    if pd.isna(date):
+        return None
+    if time_value is None or (isinstance(time_value, float) and pd.isna(time_value)):
+        return date
+    match = re.match(r"\s*(\d{1,2}):(\d{2})", str(time_value))
+    if match is None:
+        return date
+    return date + pd.Timedelta(hours=int(match.group(1)), minutes=int(match.group(2)))
 
 
 class UnmappedClubError(RuntimeError):
@@ -48,8 +72,8 @@ def build_team_rows(
     """
     rows: list[dict] = []
     for _, match in schedule.iterrows():
-        kickoff = pd.to_datetime(match["date"], errors="coerce")
-        if pd.isna(kickoff):
+        kickoff = _kickoff(match["date"], match.get("time"))
+        if kickoff is None:
             continue
         home_raw, away_raw = match["home_team"], match["away_team"]
         home_code, away_code = resolve_club(home_raw), resolve_club(away_raw)

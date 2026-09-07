@@ -11,6 +11,8 @@ completed job is harmless anyway — writes are upserts — but skipping it save
 a Cloudflare round trip, which is the scarce resource here.
 
     --force   ignore the journal and re-scrape everything
+    --reset   delete every team_matches row and the journal first (needed
+              after a kickoff_time correction -- see _reset())
 """
 
 from __future__ import annotations
@@ -24,7 +26,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from data.db import get_session  # noqa: E402
 from data.ingestors.team_matches import ingest_competition_season  # noqa: E402
+from data.models import TeamMatch  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +76,31 @@ def _save_journal(done: set[tuple[str, str]]) -> None:
     os.replace(tmp, JOURNAL)
 
 
-def main_for_test(force: bool = False) -> int:
+def _reset() -> None:
+    """Clear every ``team_matches`` row and the journal before re-running.
+
+    Needed when the kickoff_time changes, because the upsert key includes
+    it -- corrected rows would otherwise be INSERTED alongside the stale
+    ones rather than replacing them.
+    """
+    db = get_session()
+    try:
+        deleted = db.query(TeamMatch).delete()
+        db.commit()
+    finally:
+        db.close()
+    logger.info("Deleted %d team_matches rows", deleted)
+
+    if JOURNAL.exists():
+        JOURNAL.unlink()
+        logger.info("Deleted journal %s", JOURNAL)
+
+
+def main_for_test(force: bool = False, reset: bool = False) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    done = set() if force else _load_journal()
+    if reset:
+        _reset()
+    done = set() if (force or reset) else _load_journal()
     jobs = pending_jobs(done)
     logger.info("%d of %d competition-seasons outstanding", len(jobs), len(ALL_JOBS))
 
@@ -114,8 +140,15 @@ def main_for_test(force: bool = False) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--force", action="store_true", help="ignore the journal")
+    parser.add_argument(
+        "--reset", action="store_true",
+        help="Delete every team_matches row and the journal before running. "
+             "Needed when the kickoff_time changes, because the upsert key "
+             "includes it -- corrected rows would otherwise be INSERTED "
+             "alongside the stale ones rather than replacing them.",
+    )
     args = parser.parse_args()
-    return main_for_test(force=args.force)
+    return main_for_test(force=args.force, reset=args.reset)
 
 
 if __name__ == "__main__":
