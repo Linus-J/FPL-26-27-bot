@@ -57,6 +57,7 @@ def compute_congestion(matches: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataF
     Seasons never bleed into each other: a team's last match of May is not rest
     for August. That is enforced by grouping on (season, team_id), not team_id.
     """
+    anchors = anchors.reset_index(drop=True)
     out = anchors.copy()
     for col in CONGESTION_FEATURE_COLS:
         out[col] = 0.0
@@ -64,6 +65,17 @@ def compute_congestion(matches: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataF
     out["days_to_next_match"] = REST_CAP_DAYS
 
     if matches.empty or anchors.empty:
+        # Assigned once, after the loop, so every path agrees (2026-09-06).
+        # Previously this sat inside the loop body, below both a `continue`
+        # (team absent from the calendar) and an early return (empty matches
+        # frame) — so three situations that are all "no previous match,
+        # days_since = 14.0" gave two different answers. The brief's
+        # definition table defines this flag purely in terms of
+        # days_since_last_match, and 14.0 is 14.0 however it arose, so the
+        # consistent answer is the one the table already implies.
+        out["is_post_international_break"] = (
+            out["days_since_last_match"] >= INTERNATIONAL_BREAK_DAYS
+        ).astype(float)
         return out[["season", "team_id", "gameweek", *CONGESTION_FEATURE_COLS]]
 
     m = matches.copy()
@@ -74,9 +86,11 @@ def compute_congestion(matches: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataF
         for key, group in m.groupby(["season", "team_id"], sort=False)
     }
 
+    unmatched = 0
     for i, row in out.iterrows():
         group = by_team.get((row["season"], row["team_id"]))
         if group is None:
+            unmatched += 1
             continue
         anchor = row["anchor_time"]
         # Strictly before/after: the anchor match is not its own rest.
@@ -106,9 +120,28 @@ def compute_congestion(matches: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataF
                 recent_euro["competition"].map(EURO_TIERS).max()
             )
 
-        out.at[i, "is_post_international_break"] = float(
-            out.at[i, "days_since_last_match"] >= INTERNATIONAL_BREAK_DAYS
+    # A silent total miss is indistinguishable from "nobody played midweek"
+    # (2026-09-06, review finding C3). A dtype or season-format mismatch would
+    # otherwise return every row at its default and read as a fully-rested
+    # league, which is plausible enough to reach a retrain unnoticed.
+    if unmatched:
+        logger.warning(
+            "compute_congestion: %d of %d anchors had no calendar rows; "
+            "those rows carry default (fully-rested) values",
+            unmatched, len(out),
         )
+
+    # Assigned once, after the loop, so every path agrees (2026-09-06).
+    # Previously this sat inside the loop body, below both a `continue` (team
+    # absent from the calendar) and an early return (empty matches frame) — so
+    # three situations that are all "no previous match, days_since = 14.0"
+    # gave two different answers. The brief's definition table defines this
+    # flag purely in terms of days_since_last_match, and 14.0 is 14.0 however
+    # it arose, so the consistent answer is the one the table already
+    # implies.
+    out["is_post_international_break"] = (
+        out["days_since_last_match"] >= INTERNATIONAL_BREAK_DAYS
+    ).astype(float)
 
     return out[["season", "team_id", "gameweek", *CONGESTION_FEATURE_COLS]]
 
@@ -128,14 +161,15 @@ def load_congestion(season: str | None = None) -> pd.DataFrame:
 
     The anchor is the team's own PL kickoff in that gameweek, read from
     ``team_matches`` itself rather than ``fixtures`` — so this works identically
-    for the five backfilled seasons (which have no ``fixtures`` rows at all) and
+    for the six backfilled seasons (which have no ``fixtures`` rows at all) and
     for the season being played. On a double gameweek the FIRST PL kickoff of
     the week anchors it, which is the match the rest-days question is about.
     """
     db = get_session()
     try:
-        where = "WHERE tm.season = :season" if season else ""
-        params = {"season": season} if season else {}
+        where = "WHERE tm.season = :season" if season is not None else ""
+        season_clause = "AND tm.season = :season" if season is not None else ""
+        params = {"season": season} if season is not None else {}
         matches = pd.read_sql(
             text(f"""
                 SELECT tm.season, tss.team_id AS team_id, tm.kickoff_time, tm.competition
@@ -160,7 +194,7 @@ def load_congestion(season: str | None = None) -> pd.DataFrame:
                        (SELECT MIN(g2.deadline_time) FROM gameweeks g2
                          WHERE g2.season = g.season AND g2.id > g.id),
                        '9999-12-31')
-                WHERE tm.competition = 'PL' {"AND tm.season = :season" if season else ""}
+                WHERE tm.competition = 'PL' {season_clause}
                 GROUP BY tm.season, tss.team_id, g.id
             """),
             db.bind, params=params,
