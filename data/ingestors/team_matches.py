@@ -12,7 +12,6 @@ already depends on: FBref sits behind Cloudflare, which is why
 from __future__ import annotations
 
 import logging
-import re
 
 import pandas as pd
 from sqlalchemy.dialects.sqlite import insert
@@ -32,18 +31,6 @@ class UnmappedClubError(RuntimeError):
     calendar, and a gap reads as rest — so a silent drop does not thin the
     feature, it inverts it.
     """
-
-
-def _normalize(name: str) -> str:
-    """Lowercase, strip punctuation, collapse whitespace.
-
-    The collapse is load-bearing: removing "&" from "Brighton & Hove Albion"
-    leaves a double space, and an alias table keyed on single spaces would then
-    silently fail to match — the same class of invisible name-matching failure
-    that data/ingestors/odds_api.py:140-160 records as a measured production
-    incident.
-    """
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", str(name).lower())).strip()
 
 
 def build_team_rows(
