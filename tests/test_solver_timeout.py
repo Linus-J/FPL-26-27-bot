@@ -44,3 +44,32 @@ def test_generate_squad_pool_propagates_a_timeout_instead_of_returning_short():
     cfg = dataclasses.replace(OPTIMISER, solver_time_limit_seconds=0.001)
     with pytest.raises(SolverTimeout):
         generate_squad_pool(proj, players, n=5, budget=100.0, horizon=3, config=cfg)
+
+
+def test_an_integer_feasible_solution_is_treated_as_a_timeout():
+    """pulp REWRITES a timed-out-with-incumbent CBC result to status
+    "Optimal" with sol_status LpSolutionIntegerFeasible, so checking the
+    status string alone misses every timeout that actually found a squad --
+    the case the guard exists for."""
+    import pulp
+
+    from config.strategy import OPTIMISER
+    from optimiser.squad import SolverTimeout, _raise_if_not_optimal
+
+    with pytest.raises(SolverTimeout):
+        _raise_if_not_optimal(
+            "Optimal", OPTIMISER, "test solve",
+            sol_status=pulp.constants.LpSolutionIntegerFeasible,
+        )
+
+
+def test_a_genuinely_optimal_solution_does_not_raise():
+    import pulp
+
+    from config.strategy import OPTIMISER
+    from optimiser.squad import _raise_if_not_optimal
+
+    _raise_if_not_optimal(
+        "Optimal", OPTIMISER, "test solve",
+        sol_status=pulp.constants.LpSolutionOptimal,
+    )

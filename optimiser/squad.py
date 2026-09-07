@@ -62,15 +62,26 @@ def _cbc(cfg: OptimiserConfig) -> pulp.PULP_CBC_CMD:
     return pulp.PULP_CBC_CMD(msg=False, timeLimit=cfg.solver_time_limit_seconds or None)
 
 
-def _raise_if_not_optimal(status: str, cfg: OptimiserConfig, label: str) -> None:
-    """Raise on any non-Optimal CBC status (2026-09-07), distinguishing a
-    timeout from a genuinely infeasible problem.
+def _raise_if_not_optimal(
+    status: str, cfg: OptimiserConfig, label: str, sol_status: int | None = None
+) -> None:
+    """Raise on a non-optimal CBC result, distinguishing a timeout from a
+    genuinely infeasible problem.
 
-    CBC reports "Not Solved" when it stops on the time limit. That is NOT
-    the same as Infeasible, and must not be swallowed as one -- see
-    ``SolverTimeout``.
+    The status STRING is not sufficient. pulp rewrites a timed-out-with-
+    incumbent CBC result to "Optimal" and records the truth in `sol_status`
+    (coin_api.py:363-366), so checking the string alone silently accepts a
+    suboptimal squad as the answer -- which is the case this guard exists for.
+    CBC reports "Not Solved" only when it stops on the time limit WITHOUT any
+    incumbent at all; that is also not the same as Infeasible.
     """
     if status == "Optimal":
+        if sol_status == pulp.constants.LpSolutionIntegerFeasible:
+            logger.error(
+                "%s stopped on its %.0fs time limit with a feasible but "
+                "non-optimal solution", label, cfg.solver_time_limit_seconds,
+            )
+            raise SolverTimeout(f"{label} stopped on its time limit (integer feasible)")
         return
     if status == "Not Solved":
         logger.error(
@@ -85,7 +96,7 @@ def _solve(prob: pulp.LpProblem, cfg: OptimiserConfig, label: str) -> None:
     """Solve ``prob`` with CBC under the configured wall-clock limit, then
     raise on any non-Optimal status. See ``_raise_if_not_optimal``."""
     prob.solve(_cbc(cfg))
-    _raise_if_not_optimal(pulp.LpStatus[prob.status], cfg, label)
+    _raise_if_not_optimal(pulp.LpStatus[prob.status], cfg, label, sol_status=prob.sol_status)
 
 
 @dataclass
@@ -767,7 +778,9 @@ def optimise_squad(
                 vice = vice2
                 prob = prob2
 
-        _raise_if_not_optimal(pulp.LpStatus[prob.status], cfg, "ILP solver")
+        _raise_if_not_optimal(
+            pulp.LpStatus[prob.status], cfg, "ILP solver", sol_status=prob.sol_status
+        )
 
         # Week 0 is what gets reported. `starting_xi`, `captain_id` and
         # `vice_captain_id` describe the gameweek about to be locked in — the only
