@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -42,7 +43,7 @@ ALL_JOBS: list[tuple[str, str]] = [
     (season, league) for league in LEAGUES for season in SEASONS
 ]
 
-JOURNAL = Path(".omc/state/team_matches_backfill.json")
+JOURNAL = Path(__file__).resolve().parents[1] / ".omc" / "state" / "team_matches_backfill.json"
 
 
 def pending_jobs(done: set[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -61,17 +62,19 @@ def _load_journal() -> set[tuple[str, str]]:
 
 
 def _save_journal(done: set[tuple[str, str]]) -> None:
+    """Written atomically. A truncate-then-write torn by a crash leaves
+    malformed JSON, which _load_journal swallows as "start from scratch" --
+    discarding every completed job on a run whose whole point is resumability.
+    """
     JOURNAL.parent.mkdir(parents=True, exist_ok=True)
-    JOURNAL.write_text(json.dumps(sorted(done)))
+    tmp = JOURNAL.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(sorted(done)))
+    os.replace(tmp, JOURNAL)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--force", action="store_true", help="ignore the journal")
-    args = parser.parse_args()
-
+def main_for_test(force: bool = False) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    done = set() if args.force else _load_journal()
+    done = set() if force else _load_journal()
     jobs = pending_jobs(done)
     logger.info("%d of %d competition-seasons outstanding", len(jobs), len(ALL_JOBS))
 
@@ -79,6 +82,20 @@ def main() -> int:
     for season, league in jobs:
         try:
             written = ingest_competition_season(season, league)
+            if written == 0:
+                # NOT journalled. build_team_rows raises only for an
+                # unresolvable PREMIER LEAGUE club; elsewhere it skips
+                # silently, which is right for Real Madrid and wrong for an
+                # English club FBref spells differently. Recording a 0-row
+                # scrape as done would make the re-run skip it forever, and
+                # the resulting calendar gap reads as REST rather than as
+                # missing data.
+                logger.error(
+                    "FAIL %s %s: wrote 0 rows; not journalled so a re-run retries it",
+                    league, season,
+                )
+                failures.append((season, league))
+                continue
             logger.info("OK   %s %s (%d rows)", league, season, written)
             done.add((season, league))
             _save_journal(done)
@@ -92,6 +109,13 @@ def main() -> int:
         return 1
     logger.info("Backfill complete: %d competition-seasons", len(ALL_JOBS))
     return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--force", action="store_true", help="ignore the journal")
+    args = parser.parse_args()
+    return main_for_test(force=args.force)
 
 
 if __name__ == "__main__":

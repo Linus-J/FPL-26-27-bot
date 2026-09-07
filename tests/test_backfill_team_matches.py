@@ -41,3 +41,53 @@ def test_the_premier_league_is_scraped_before_the_european_competitions():
     assert all(
         league == "ENG-Premier League" for _, league in ALL_JOBS[:first_euro]
     )
+
+
+def test_the_journal_path_is_anchored_to_the_repo_not_the_cwd():
+    """Run from anywhere but the repo root and a CWD-relative journal makes
+    resume silently restart from zero. settings.py records this project losing
+    five weeks to exactly that class of bug."""
+    from scripts.backfill_team_matches import JOURNAL
+
+    assert JOURNAL.is_absolute()
+
+
+def test_a_zero_row_job_is_not_recorded_as_done(tmp_path, monkeypatch):
+    """I1: journalling a 0-row scrape makes the re-run skip it forever, and a
+    missing club's calendar gap reads as REST."""
+    import scripts.backfill_team_matches as bf
+
+    monkeypatch.setattr(bf, "JOURNAL", tmp_path / "j.json")
+    monkeypatch.setattr(bf, "ALL_JOBS", [("2021-22", "INT-Champions League")])
+    monkeypatch.setattr(bf, "ingest_competition_season", lambda season, league: 0)
+
+    rc = bf.main_for_test()
+
+    assert rc == 1, "a zero-row job must be reported as a failure"
+    assert bf._load_journal() == set(), "a zero-row job must not be journalled"
+
+
+def test_a_job_that_wrote_rows_is_recorded_as_done(tmp_path, monkeypatch):
+    import scripts.backfill_team_matches as bf
+
+    monkeypatch.setattr(bf, "JOURNAL", tmp_path / "j.json")
+    monkeypatch.setattr(bf, "ALL_JOBS", [("2021-22", "INT-Champions League")])
+    monkeypatch.setattr(bf, "ingest_competition_season", lambda season, league: 380)
+
+    rc = bf.main_for_test()
+
+    assert rc == 0
+    assert bf._load_journal() == {("2021-22", "INT-Champions League")}
+
+
+def test_a_partly_written_journal_does_not_discard_completed_jobs(tmp_path, monkeypatch):
+    """The atomic-write guarantee: a torn file must never silently reset
+    progress on a run whose entire purpose is resumability."""
+    import scripts.backfill_team_matches as bf
+
+    journal = tmp_path / "j.json"
+    monkeypatch.setattr(bf, "JOURNAL", journal)
+    bf._save_journal({("2021-22", "ENG-Premier League")})
+    assert bf._load_journal() == {("2021-22", "ENG-Premier League")}
+    # No stray temp file left behind.
+    assert list(tmp_path.iterdir()) == [journal]
