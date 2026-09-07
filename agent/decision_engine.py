@@ -126,15 +126,18 @@ def _load_squad_state(
     db = get_session()
     try:
         if sim_manager_id is not None:
+            # 50 rows is far more than the walk-back can ever need -- there
+            # are at most two Free Hits in a season -- while still bounding
+            # the read.
             query = text("""
                 SELECT details FROM sim_decision_log
                 WHERE sim_manager_id = :sim_manager_id AND decision_type = 'lineup'
                   AND (:decided_gw IS NULL OR gameweek < :decided_gw)
-                ORDER BY created_at DESC LIMIT 1
+                ORDER BY created_at DESC LIMIT 50
             """)
-            row = db.execute(
+            rows = db.execute(
                 query, {"sim_manager_id": sim_manager_id, "decided_gw": decided_gw}
-            ).fetchone()
+            ).fetchall()
         else:
             query = text("""
                 SELECT dl.details
@@ -142,31 +145,51 @@ def _load_squad_state(
                 WHERE dl.decision_type = 'lineup'
                   AND (:decided_gw IS NULL OR dl.gameweek < :decided_gw)
                 ORDER BY dl.created_at DESC
-                LIMIT 1
+                LIMIT 50
             """)
-            row = db.execute(query, {"decided_gw": decided_gw}).fetchone()
-        if row:
-            details = json.loads(row[0])
-            squad_ids = details.get("squad_ids", [])
-            budget = details.get("budget", SQUAD.budget_total)
-            free_transfers = details.get("free_transfers", 1)
-            # JSON object keys are strings; the rest of the engine keys
-            # players by int.
-            purchase_prices = {
-                int(pid): float(price)
-                for pid, price in (details.get("purchase_prices") or {}).items()
-            }
-            bank = details.get("bank")
-            return SquadState(
-                squad_ids=squad_ids,
-                budget=float(budget),
-                free_transfers=int(free_transfers),
-                bank=float(bank) if bank is not None else 0.0,
-                purchase_prices=purchase_prices,
-            )
-        return SquadState([], SQUAD.budget_total, 1, 0.0, {})
+            rows = db.execute(query, {"decided_gw": decided_gw}).fetchall()
     finally:
         db.close()
+
+    if not rows:
+        return SquadState([], SQUAD.budget_total, 1, 0.0, {})
+
+    latest = json.loads(rows[0][0])
+    budget = latest.get("budget", SQUAD.budget_total)
+    free_transfers = latest.get("free_transfers", 1)
+    # JSON object keys are strings; the rest of the engine keys players by
+    # int.
+    purchase_prices = {
+        int(pid): float(price)
+        for pid, price in (latest.get("purchase_prices") or {}).items()
+    }
+    bank = latest.get("bank")
+
+    # squad_ids ONLY comes from the most recent non-Free-Hit lineup. A Free
+    # Hit squad is handed back at the deadline, so it is never what we own
+    # next week -- the engine used to believe it was, and planned transfers
+    # selling players it did not own (live, GW4 2026-27).
+    #
+    # A WILDCARD squad genuinely persists, so wildcard rows are not skipped.
+    #
+    # Everything else -- bank, free transfers, purchase prices -- is already
+    # carried correctly across a Free Hit by the settle step, so it comes
+    # from the latest row whatever chip that row played (above).
+    squad_ids: list[int] = []
+    for (raw,) in rows:
+        details = json.loads(raw)
+        if details.get("chip_considered") == Chip.FREE_HIT.value:
+            continue
+        squad_ids = details.get("squad_ids", [])
+        break
+
+    return SquadState(
+        squad_ids=squad_ids,
+        budget=float(budget),
+        free_transfers=int(free_transfers),
+        bank=float(bank) if bank is not None else 0.0,
+        purchase_prices=purchase_prices,
+    )
 
 
 def _load_own_decision_log(sim_manager_id: int | None) -> pd.DataFrame:
