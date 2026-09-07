@@ -3,6 +3,7 @@ import argparse
 import dataclasses
 import logging
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -22,6 +23,7 @@ from optimiser.chips import Chip, recommend_chip
 from optimiser.squad import (
     STARTING_MAX,
     STARTING_MIN,
+    SolverTimeout,
     generate_squad_pool,
     optimise_squad,
     optimise_squad_joint,
@@ -47,6 +49,38 @@ logger = logging.getLogger(__name__)
 _BACKTEST_CONFIG = dataclasses.replace(OPTIMISER, risk_level=0.0, mu_baseline=0.0, mu_range=0.0)
 
 _load_all_stats = assemble.load_all_stats  # moved to assemble.py (P3-0) — shared with pipeline.py
+
+
+def _drop_note(exc: Exception, infeasible_note: str) -> str:
+    """How to describe a gameweek the solver could not deliver.
+
+    ``SolverTimeout`` subclasses ``RuntimeError`` (optimiser/squad.py:44) so
+    that existing handlers keep catching it — which is exactly what made it
+    indistinguishable from a genuine infeasibility in the log. The two call for
+    opposite responses: an infeasible squad is a modelling bug to fix, a
+    timeout is a wall-clock budget to raise.
+    """
+    if isinstance(exc, SolverTimeout):
+        return "timed out (raise OPTIMISER.solver_time_limit_seconds)"
+    return infeasible_note
+
+
+def _unscored_gameweeks(scored: Iterable[int], attempted: Iterable[int]) -> list[int]:
+    """Gameweeks the loop entered that produced no row.
+
+    Every solver failure logs and skips its gameweek, and the completion
+    summary's ``GW%d-%d`` comes from min/max — which cannot show a hole.
+    "GW6-38" prints identically whether 33 weeks scored or 3. run_backtest's
+    headline total is a SUM over the surviving rows, so each dropped week
+    quietly deflates the number the exit gate reads.
+
+    ``attempted`` is the gameweeks the loop actually ran, not ``range(start_gw,
+    end_gw + 1)``: all three harnesses iterate the gameweeks present in
+    ``all_stats``, so a season with no data for a week never attempted it and
+    reporting it as dropped would be noise.
+    """
+    present = {int(gw) for gw in scored}
+    return sorted({int(gw) for gw in attempted} - present)
 
 
 def _load_players_snapshot(season: str, target_gw: int) -> pd.DataFrame:
@@ -670,7 +704,7 @@ def run_backtest(
                         hits = 0
                         squad_df = solution.squad
         except Exception as e:
-            logger.error("GW%d: optimiser failed — %s", gw, e)
+            logger.error("GW%d: optimiser %s — %s", gw, _drop_note(e, "failed"), e)
             continue
 
         try:
@@ -683,8 +717,8 @@ def run_backtest(
                 if "position" in squad_df.columns else {}
             )
             logger.error(
-                "GW%d: starting XI infeasible — squad size=%d pos=%s — %s",
-                gw, len(squad_df), pos_counts, e,
+                "GW%d: starting XI %s — squad size=%d pos=%s — %s",
+                gw, _drop_note(e, "infeasible"), len(squad_df), pos_counts, e,
             )
             continue
         starting_ids = xi_solution.starting_xi["id"].tolist()
@@ -786,6 +820,14 @@ def run_backtest(
             df["actual_pts"].mean(),
             df["net_pts"].sum(),
             df["predicted_xpts"].mean(),
+        )
+    attempted = [gw for gw in available_gws if start_gw <= gw <= end_gw]
+    unscored = _unscored_gameweeks(df["gameweek"] if not df.empty else [], attempted)
+    if unscored:
+        logger.warning(
+            "%d of %d attempted gameweeks produced no row and are MISSING from "
+            "the figures above: %s. See the per-gameweek errors for why.",
+            len(unscored), len(attempted), unscored,
         )
     return df
 
@@ -896,7 +938,7 @@ def run_naive_xi_backtest(
                                           budget=budget, horizon=horizon, season=season,
                                           config=_BACKTEST_CONFIG)
             except Exception as e:
-                logger.error("GW%d: initial squad build failed — %s", gw, e)
+                logger.error("GW%d: initial squad build %s — %s", gw, _drop_note(e, "failed"), e)
                 continue
             squad_ids = solution.squad["id"].tolist()
             squad_static = solution.squad[["id", "position", "team_id", "web_name"]].copy()
@@ -909,7 +951,7 @@ def run_naive_xi_backtest(
                 squad_df, projections, gw, season=season, config=_BACKTEST_CONFIG
             )
         except RuntimeError as e:
-            logger.error("GW%d: starting XI infeasible — %s", gw, e)
+            logger.error("GW%d: starting XI %s — %s", gw, _drop_note(e, "infeasible"), e)
             continue
 
         starting_ids = xi_solution.starting_xi["id"].tolist()
@@ -942,6 +984,14 @@ def run_naive_xi_backtest(
             "Naive-XI backtest complete: GW%d–%d | avg actual=%.1f | avg xPts=%.1f",
             df["gameweek"].min(), df["gameweek"].max(),
             df["actual_pts"].mean(), df["predicted_xpts"].mean(),
+        )
+    attempted = [gw for gw in available_gws if start_gw <= gw <= end_gw]
+    unscored = _unscored_gameweeks(df["gameweek"] if not df.empty else [], attempted)
+    if unscored:
+        logger.warning(
+            "%d of %d attempted gameweeks produced no row and are MISSING from "
+            "the figures above: %s. See the per-gameweek errors for why.",
+            len(unscored), len(attempted), unscored,
         )
     return df
 
@@ -1043,7 +1093,7 @@ def run_rebuild_backtest(
                 budget=budget, horizon=horizon, config=mean_cfg,
             )
         except (RuntimeError, ValueError) as e:
-            logger.error("GW%d: pool generation failed — %s", gw, e)
+            logger.error("GW%d: pool generation %s — %s", gw, _drop_note(e, "failed"), e)
             continue
         if not shared_pool:
             logger.error("GW%d: no feasible squad", gw)
@@ -1066,6 +1116,14 @@ def run_rebuild_backtest(
             df["gameweek"].min(), df["gameweek"].max(),
             df["actual_pts"].mean(), df["n_clubs_at_cap"].mean(),
         )
+    attempted = [gw for gw in available_gws if start_gw <= gw <= end_gw]
+    unscored = _unscored_gameweeks(df["gameweek"] if not df.empty else [], attempted)
+    if unscored:
+        logger.warning(
+            "%d of %d attempted gameweeks produced no row and are MISSING from "
+            "the figures above: %s. See the per-gameweek errors for why.",
+            len(unscored), len(attempted), unscored,
+        )
     return df
 
 
@@ -1085,7 +1143,7 @@ def _score_one_rebuild(
             horizon=horizon, config=cfg,
         )
     except (RuntimeError, ValueError) as e:
-        logger.error("GW%d: squad build failed — %s", gw, e)
+        logger.error("GW%d: squad build %s — %s", gw, _drop_note(e, "failed"), e)
         return
 
     try:
@@ -1093,7 +1151,7 @@ def _score_one_rebuild(
             solution.squad, projections, gw, season=season, config=cfg
         )
     except RuntimeError as e:
-        logger.error("GW%d: starting XI infeasible — %s", gw, e)
+        logger.error("GW%d: starting XI %s — %s", gw, _drop_note(e, "infeasible"), e)
         return
 
     squad_ids = [int(i) for i in solution.squad["id"]]
