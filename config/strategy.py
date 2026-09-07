@@ -294,6 +294,17 @@ class ChipTimingThresholds:
 
     bench_boost_min_bench_xpts: float = 20.0
 
+    # How much better a LATER bench-boost week must be before the chip is held
+    # back rather than played now (2026-09-06).
+    #
+    # By analogy with triple_captain_dgw_wait_multiplier, which encodes the
+    # same "is this week worth a scarce per-half use" question. A margin rather
+    # than a bare argmax matters because projections a few weeks out are mostly
+    # strength-model output; without one, ordinary week-to-week noise would
+    # defer the chip indefinitely and expire it -- which is the failure the
+    # 2026-08-18 change to _try_bb existed to stop. 0.0 disables holding.
+    bench_boost_hold_margin_xpts: float = 2.0
+
     # 2026-07-30 (user's own review: "how can it ever be worth not playing
     # [TC]? It is only negative if the player gets < 0 points"). Rebased
     # from a GAP (best captain xPts minus the second-best) to the captain's
