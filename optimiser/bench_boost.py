@@ -110,3 +110,16 @@ def should_hold_bench_boost(
     if target_gw <= current_gw:
         return False
     return (target_bench - current_bench) > margin
+
+
+def pivot_price(unconstrained_ids: list[int], bb_ready_ids: list[int]) -> dict:
+    """What it costs to move from the unconstrained squad to the BB-ready one.
+
+    This is the deliverable of the whole bench-boost half. The trap it reports
+    on is arriving at a gameweek with excellent BB fixtures holding a fodder
+    bench, no bank and few free transfers -- and the price of escaping it is
+    denominated in transfers, so that is the unit it is quoted in.
+    """
+    out = sorted(set(unconstrained_ids) - set(bb_ready_ids))
+    incoming = sorted(set(bb_ready_ids) - set(unconstrained_ids))
+    return {"transfers_required": len(out), "out": out, "in": incoming}

@@ -28,6 +28,11 @@ unpriced correlation does the most damage.
 **Bench.** What the bench cost and what it would contribute, so the standard
 "bench fodder" trade is a visible choice rather than an accident.
 
+**Bench-boost readiness.** This squad, side by side with a hypothetical one
+built for the best bench-boost week in the projection window, and the price
+of moving from one to the other in transfers. Neither is the answer -- the
+squad above remains that -- this only prices the alternative.
+
     uv run python scripts/explain_squad.py --season 2026-27
     uv run python scripts/explain_squad.py --out /tmp/why.md
 """
@@ -46,9 +51,15 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(mes
 import pandas as pd  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 
-from config.strategy import OPTIMISER, SQUAD  # noqa: E402
+from config.strategy import CHIP_TIMING, OPTIMISER, SQUAD  # noqa: E402
 from data.db import get_session  # noqa: E402
 from data.ingestors.odds_api import odds_coverage_by_gameweek  # noqa: E402
+from optimiser.bench_boost import (  # noqa: E402
+    bb_ready_config,
+    bench_xpts_by_gameweek,
+    pivot_price,
+    select_bb_target_gw,
+)
 from optimiser.squad import optimise_squad  # noqa: E402
 from projection import cold_start  # noqa: E402
 from projection.cold_start import prior_season_of  # noqa: E402
@@ -247,6 +258,84 @@ def _pool_section(
     return lines
 
 
+def _bb_readiness_section(
+    solution, projections: pd.DataFrame, players: pd.DataFrame, season: str, current_gw: int
+) -> list[str]:
+    """This squad against a hypothetical one built for the best bench-boost
+    week in the window, and what moving between them costs.
+
+    Neither squad is chosen here -- `solution` (the one reported everywhere
+    else in this document) remains the answer regardless of what this section
+    says. See `optimiser/bench_boost.py`'s module docstring for why automatic
+    selection between the two is deliberately absent.
+    """
+    threshold = CHIP_TIMING.bench_boost_min_bench_xpts
+    unconstrained_ids = solution.squad["id"].tolist()
+    totals = bench_xpts_by_gameweek(unconstrained_ids, projections, current_gw)
+    target = select_bb_target_gw(unconstrained_ids, projections, current_gw, threshold)
+
+    if target is None:
+        lines = [
+            f"**No gameweek in the projection window clears the bench-boost threshold "
+            f"({threshold:.1f} xPts)** -- no BB-ready squad was built."
+        ]
+        if totals:
+            best_gw = max(totals, key=lambda gw: totals[gw])
+            lines.append(
+                f"Best bench in window: GW{best_gw} at {totals[best_gw]:.2f} xPts."
+            )
+        return lines
+
+    target_gw, unconstrained_bench_xpts = target
+    target_projections = projections[projections["gameweek"] == target_gw]
+    bb_solution = optimise_squad(
+        projections=target_projections, players=players, budget=SQUAD.budget_total,
+        horizon=1, season=season, config=bb_ready_config(OPTIMISER, target_gw),
+    )
+    bb_ready_ids = bb_solution.squad["id"].tolist()
+    bb_ready_bench_xpts = bench_xpts_by_gameweek(
+        bb_ready_ids, projections, target_gw
+    ).get(target_gw, 0.0)
+    price = pivot_price(unconstrained_ids, bb_ready_ids)
+
+    lines = [f"Best bench-boost week in window: **GW{target_gw}**.", ""]
+    lines.append(
+        f"| squad | XI xPts | bench xPts (GW{target_gw}) | £m spent | spare bank |"
+    )
+    lines.append("| --- | --- | --- | --- | --- |")
+    lines.append(
+        f"| this squad (unconstrained) | {solution.total_xpts:.2f} | "
+        f"{unconstrained_bench_xpts:.2f} | {solution.total_cost:.1f} | "
+        f"{SQUAD.budget_total - solution.total_cost:.1f} |"
+    )
+    lines.append(
+        f"| BB-ready for GW{target_gw} | {bb_solution.total_xpts:.2f} | "
+        f"{bb_ready_bench_xpts:.2f} | {bb_solution.total_cost:.1f} | "
+        f"{SQUAD.budget_total - bb_solution.total_cost:.1f} |"
+    )
+    lines.append("")
+    lines.append(
+        f"**Pivot price: {price['transfers_required']} transfer"
+        f"{'s' if price['transfers_required'] != 1 else ''}** to move from this squad to the "
+        "BB-ready one."
+    )
+    if price["transfers_required"]:
+        out_names = ", ".join(
+            sorted(players.loc[players["id"].isin(price["out"]), "web_name"])
+        )
+        in_names = ", ".join(
+            sorted(players.loc[players["id"].isin(price["in"]), "web_name"])
+        )
+        lines.append(f"Out: {out_names}. In: {in_names}.")
+    lines.append("")
+    lines.append(
+        "This is information, not a recommendation -- the squad above is still the answer. "
+        "An option-value term that decided between them would need calibration this project "
+        "has refused elsewhere."
+    )
+    return lines
+
+
 def _continuity_section(df: pd.DataFrame, season: str) -> list[str]:
     """Who in this squad has actually played for the club he is now at.
 
@@ -439,6 +528,12 @@ def build_report(season: str, pool_size: int = 0) -> str:
         "of a thin bench still only appears when somebody in the XI does not play, and nothing "
         "here forecasts a specific absence."
     )
+    out.append("")
+
+    out.append("## Bench-boost readiness")
+    out.append("")
+    out.extend(_bb_readiness_section(solution, projections, players, season, min(gw_cols)))
+
     return "\n".join(out)
 
 

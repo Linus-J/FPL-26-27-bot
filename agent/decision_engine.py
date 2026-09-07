@@ -20,6 +20,12 @@ from data.db import get_session
 from data.ingestors.ownership import load_latest_ownership
 from data.models import ChipComparisonLog, DecisionLog, SimDecisionLog, SimManager
 from data.overrides import apply_team_overrides, load_p_leave_overrides, log_rumoured_squad_members
+from optimiser.bench_boost import (
+    bb_ready_config,
+    bench_xpts_by_gameweek,
+    pivot_price,
+    select_bb_target_gw,
+)
 from optimiser.chip_comparison import compare_chip_options
 from optimiser.chips import (
     Chip,
@@ -345,6 +351,62 @@ def _bench_xpts(squad_ids: list[int], projections: pd.DataFrame, gw: int) -> flo
     if len(gw_proj) <= 11:
         return 0.0
     return float(gw_proj.iloc[11:]["xpts"].sum())
+
+
+def _bench_boost_readiness(
+    *,
+    unconstrained_squad,
+    projections: pd.DataFrame,
+    players: pd.DataFrame,
+    next_gw: int,
+    available_budget: float,
+    ownership: pd.DataFrame | None,
+    config: OptimiserConfig,
+    season: str | None,
+    chip_timing: ChipTimingThresholds,
+) -> dict:
+    """The unconstrained squad's answer plus, when a target week exists, a
+    BB-ready alternative and the price of moving between them.
+
+    Neither squad is selected here -- ``unconstrained_squad`` remains the
+    decision regardless of what this reports. See
+    ``optimiser/bench_boost.py``'s module docstring for why automatic
+    selection between the two is deliberately absent.
+    """
+    unconstrained_ids = unconstrained_squad.squad["id"].tolist()
+    target = select_bb_target_gw(
+        unconstrained_ids, projections, next_gw, chip_timing.bench_boost_min_bench_xpts,
+    )
+    if target is None:
+        return {
+            "target_gameweek": None,
+            "reason": (
+                "no gameweek in the projection window clears the bench-boost "
+                f"threshold ({chip_timing.bench_boost_min_bench_xpts:.1f} xPts)"
+            ),
+        }
+    target_gw, unconstrained_bench_xpts = target
+    bb_solution = optimise_squad_joint(
+        projections,
+        players,
+        budget=available_budget,
+        horizon=1,
+        season=season,
+        gameweek=target_gw,
+        ownership=ownership,
+        config=bb_ready_config(config, target_gw),
+    )
+    bb_ready_ids = bb_solution.squad["id"].tolist()
+    bb_ready_bench_xpts = bench_xpts_by_gameweek(
+        bb_ready_ids, projections, target_gw
+    ).get(target_gw, 0.0)
+    return {
+        "target_gameweek": target_gw,
+        "unconstrained_bench_xpts": round(unconstrained_bench_xpts, 2),
+        "bb_ready_bench_xpts": round(bb_ready_bench_xpts, 2),
+        "bb_ready_total_cost": round(bb_solution.total_cost, 1),
+        "pivot_price": pivot_price(unconstrained_ids, bb_ready_ids),
+    }
 
 
 def _chip_comparison_rows(
@@ -749,6 +811,25 @@ def _run_decision_cycle(
 
     xi_solution = squad_solution
 
+    # 2026-09-06 (Task 7): both squads, reported side by side. Best-effort --
+    # a second squad solve failing must never take down the decision that the
+    # unconstrained solve above already completed fine.
+    try:
+        bench_boost_readiness = _bench_boost_readiness(
+            unconstrained_squad=squad_solution,
+            projections=projections,
+            players=players,
+            next_gw=next_gw,
+            available_budget=available_budget,
+            ownership=ownership,
+            config=config,
+            season=season,
+            chip_timing=chip_timing,
+        )
+    except Exception as exc:  # noqa: BLE001 -- shadow work never breaks a run
+        logger.warning("bench-boost readiness skipped: %s", exc)
+        bench_boost_readiness = {"target_gameweek": None, "reason": f"error: {exc}"}
+
     dgw_coverage = get_dgw_coverage(
         squad_solution.squad["id"].tolist(), players, dgw_gws, projections
     )
@@ -781,6 +862,7 @@ def _run_decision_cycle(
         "total_xpts": round(xi_solution.total_xpts, 2),
         "total_cost": round(squad_solution.total_cost, 1),
         "dgw_coverage": dgw_coverage,
+        "bench_boost_readiness": bench_boost_readiness,
     }
 
     _record_decision(
