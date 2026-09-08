@@ -1312,9 +1312,14 @@ def build_initial_squad(
         left_on="id", right_on="player_id", how="left",
     ).drop(columns=["player_id"], errors="ignore")
 
+    # `cfg`, not `config`: identical today only because `optimise_squad`
+    # repeats the `config or OPTIMISER` fallback itself. Passing the resolved
+    # one means the config this function reasoned about is the config that
+    # solves -- including its bench-weight derive-and-re-solve pass, a cold
+    # start being a rebuild path.
     solution = optimise_squad(
         projections=projections, players=players, budget=budget,
-        horizon=cfg.cold_start_lookahead_gws, season=season, config=config,
+        horizon=cfg.cold_start_lookahead_gws, season=season, config=cfg,
     )
     log_rumoured_squad_members(solution.squad["id"].tolist(), players)
     log_capped_squad_members(solution.squad["id"].tolist(), players, rotation_caps)

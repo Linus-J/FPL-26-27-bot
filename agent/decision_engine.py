@@ -26,6 +26,7 @@ from optimiser.bench_boost import (
     pivot_price,
     select_bb_target_gw,
 )
+from optimiser.bench_weights import derive_bench_config
 from optimiser.chip_comparison import compare_chip_options
 from optimiser.chips import (
     Chip,
@@ -732,6 +733,22 @@ def _run_decision_cycle(
         projections[projections["gameweek"] == next_gw][["player_id", "start_probability"]],
         left_on="id", right_on="player_id", how="left",
     ).drop(columns=["player_id"], errors="ignore")
+
+    # One bench-weight derivation for the whole decision (2026-09-08), placed
+    # here because this is the first line at which `players` carries
+    # `start_probability` and the last one before any consumer runs. Every
+    # downstream call already passes `config=config` -- `compare_chip_options`,
+    # `recommend_chip`, `optimise_squad_joint`, `evaluate_transfers`,
+    # `optimise_starting_xi`, `_bench_boost_readiness` -- so this single rebind
+    # reaches all six without touching them, which is the whole point: the
+    # squad build and the weekly transfer planner must price the same bench
+    # slot identically or the planner sells back the substitute the build just
+    # paid for (`optimiser/transfers.py:417-431`).
+    #
+    # Inert unless `derive_bench_weights_per_solve` is on, and on an empty
+    # `squad_ids` (the mid-season no-saved-squad case below, and the cold
+    # start) it returns `config` unchanged -- those rebuild instead.
+    config = derive_bench_config(config, squad_ids, projections, players, next_gw)
 
     if not squad_ids:
         logger.warning(

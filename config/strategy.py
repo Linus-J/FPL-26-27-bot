@@ -676,15 +676,18 @@ class OptimiserConfig:
     # names this as the known gap and FPLReview's solver as precedent.
     #
     # Circular by nature (the weights depend on the XI, which depends on the
-    # weights), so the caller runs a short fixed-point pass. False reproduces
-    # the pre-2026-09-06 behaviour exactly, which is what makes the change
-    # measurable rather than assumed.
+    # weights), so it is answered in two shapes -- one hoisted derivation from
+    # the incumbent XI on the ordinary weekly path, one derive-and-re-solve
+    # pass inside `optimise_squad` on the rebuild paths. See
+    # `optimiser/bench_weights.py`'s module docstring for why those are
+    # different questions rather than one question solved twice. False
+    # reproduces the pre-2026-09-06 behaviour exactly, which is what makes the
+    # change measurable rather than assumed.
+    #
+    # The `bench_weight_fixed_point_iterations` cap that sat here went with the
+    # loop (2026-09-08): nothing reads it, and a knob nothing reads lies about
+    # how the code behaves.
     derive_bench_weights_per_solve: bool = False
-
-    # Iterations of that fixed-point pass. Two is almost always enough: the
-    # first re-solve moves the XI, the second confirms it. Bounded because each
-    # iteration is a full ILP solve.
-    bench_weight_fixed_point_iterations: int = 3
 
 
 # ---------------------------------------------------------------------------

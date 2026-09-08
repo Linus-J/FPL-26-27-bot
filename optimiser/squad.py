@@ -7,10 +7,9 @@ import pulp
 
 from config.strategy import OPTIMISER, SQUAD, OptimiserConfig
 from optimiser.bench_weights import (
+    bench_config_for_xi,
     bench_gk_weight_for_week,
     bench_slot_weight_for_week,
-    derive_gk_weight,
-    derive_slot_weights,
 )
 from optimiser.captaincy import scenario_based_captain
 from optimiser.scoring import lambda_mu_for_risk_level, risk_adjusted_score
@@ -874,10 +873,20 @@ def optimise_squad(
 
     solution = _solve_once(cfg)
 
-    # Fixed point on the bench weights (2026-09-06). The weights depend on the
-    # XI and the XI depends on the weights, so solve, re-derive, re-solve.
-    # Converges in one or two rounds in practice because the XI is stable under
-    # a small change in bench pricing; the cap bounds the worst case.
+    # One derive-and-re-solve pass on the bench weights (2026-09-08). The
+    # weights depend on the XI and the XI depends on the weights, so solve,
+    # derive from what came back, solve once more. Deliberately NOT a fixed
+    # point: the loop this replaced kept only the immediately preceding XI, so
+    # an A->B->A->B cycle never tripped its equality check, burned the
+    # iteration cap, and returned a solution whose XI was B priced under A's
+    # weights. A single pass has no cycle to fall into and costs exactly two
+    # solves (0.5s -> 1.1s measured on the live GW4 frame).
+    #
+    # Every path that reaches here REBUILDS the squad -- free hit, wildcard,
+    # cold start -- so deriving from the solved XI is right here and hoisting
+    # from the incumbent would be describing a squad about to be sold. The
+    # ordinary weekly path never arrives at all; it calls `evaluate_transfers`,
+    # which takes its weights from `bench_weights.derive_bench_config` instead.
     #
     # Named `_solve_once` here rather than `_solve`, which the brief sketched:
     # a module-level `_solve(prob, cfg, label)` already exists in this file
@@ -889,33 +898,24 @@ def optimise_squad(
         if "start_probability" not in players.columns:
             logger.warning(
                 "derive_bench_weights_per_solve is set but `players` has no "
-                "start_probability column; skipping the fixed-point pass"
+                "start_probability column; keeping the static bench weights"
             )
         else:
-            positions_by_id = dict(zip(df["id"], df["position"], strict=True))
-            probs = players.set_index("id")["start_probability"]
-            previous_xi: set[int] | None = None
-            for _ in range(cfg.bench_weight_fixed_point_iterations):
-                xi_ids = set(solution.starting_xi["id"])
-                if xi_ids == previous_xi:
-                    break
-                previous_xi = xi_ids
-                outfield = [
-                    float(probs.get(pid, 0.9))
-                    for pid in xi_ids
-                    if positions_by_id.get(pid) != "GKP"
-                ]
-                keepers = [
-                    float(probs.get(pid, 0.9))
-                    for pid in xi_ids
-                    if positions_by_id.get(pid) == "GKP"
-                ]
-                cfg = dataclasses.replace(
-                    cfg,
-                    bench_slot_weights=derive_slot_weights(outfield),
-                    bench_gk_weight=derive_gk_weight(keepers[0] if keepers else 0.9),
-                )
-                solution = _solve_once(cfg)
+            derived = bench_config_for_xi(
+                cfg,
+                [int(pid) for pid in solution.starting_xi["id"]],
+                dict(zip(players["id"], players["start_probability"], strict=True)),
+                dict(zip(df["id"], df["position"], strict=True)),
+            )
+            logger.info(
+                "Bench weights derived from the solved XI: slots=%s gk=%.3f "
+                "(was slots=%s gk=%.3f)",
+                tuple(round(w, 3) for w in derived.bench_slot_weights),
+                derived.bench_gk_weight,
+                tuple(round(w, 3) for w in cfg.bench_slot_weights),
+                cfg.bench_gk_weight,
+            )
+            solution = _solve_once(derived)
 
     return solution
 

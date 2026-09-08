@@ -104,3 +104,94 @@ def test_flag_on_lifts_the_bench_of_a_fragile_squad():
     on = dataclasses.replace(OPTIMISER, derive_bench_weights_per_solve=True)
     out = optimise_squad(proj, players, budget=100.0, horizon=1, config=on)
     assert len(out.squad) == 15
+
+
+# --- B3c: the hoist, and the NaN hardening it makes a precondition ---------
+#
+# `derive_bench_config` reads start probabilities off the INCUMBENT squad,
+# taken from the decision log, and so bypasses `optimise_squad`'s
+# `start_probability >= min_start_probability` filter. NaN fails every `>=`,
+# so that filter was what kept a NaN out of the weights; without it a squad
+# member absent from this gameweek's projections reaches the derivation
+# directly. On the live GW4 frame 386 of 1021 players carry a NaN.
+
+
+def test_a_nan_start_probability_does_not_poison_the_weights():
+    """`players.merge(how="left")` leaves an absent player PRESENT with a NaN,
+    so `probs.get(pid, default)` returns the NaN — the default fires only on a
+    MISSING key. One NaN made `derive_slot_weights` return (nan, nan, nan),
+    and PuLP then raised `PulpError`, which is not a `RuntimeError` and so is
+    not caught by `generate_squad_pool`'s handler."""
+    import math
+
+    from config.strategy import OPTIMISER
+    from optimiser.bench_weights import bench_config_for_xi
+
+    xi = list(range(1, 12))
+    probs = {pid: 0.9 for pid in xi}
+    probs[5] = float("nan")
+    positions = {pid: ("GKP" if pid == 1 else "MID") for pid in xi}
+
+    out = bench_config_for_xi(OPTIMISER, xi, probs, positions)
+    assert all(math.isfinite(w) for w in out.bench_slot_weights)
+    assert out.bench_slot_weights[0] > out.bench_slot_weights[1] > out.bench_slot_weights[2]
+
+
+def test_a_nan_keeper_probability_is_not_silently_priced_at_zero():
+    """`derive_gk_weight(nan)` returned 0.0 — it did not propagate the poison,
+    it quietly valued the bench keeper at nothing. That is the harder failure
+    of the two to notice."""
+    from config.strategy import OPTIMISER
+    from optimiser.bench_weights import FALLBACK_START_PROBABILITY, bench_config_for_xi
+
+    xi = list(range(1, 12))
+    probs = {pid: 0.9 for pid in xi}
+    probs[1] = float("nan")
+    positions = {pid: ("GKP" if pid == 1 else "MID") for pid in xi}
+
+    out = bench_config_for_xi(OPTIMISER, xi, probs, positions)
+    assert out.bench_gk_weight == pytest.approx(1.0 - FALLBACK_START_PROBABILITY)
+    assert out.bench_gk_weight > 0.0
+
+
+def test_a_squad_member_missing_from_the_frame_falls_back_rather_than_vanishing():
+    """A departed player can be in the saved squad and absent from the merge
+    entirely. Ten outfielders must still be priced as ten, not as nine."""
+    from config.strategy import OPTIMISER
+    from optimiser.bench_weights import FALLBACK_START_PROBABILITY, bench_config_for_xi
+
+    xi = list(range(1, 12))
+    positions = {pid: ("GKP" if pid == 1 else "MID") for pid in xi}
+    probs = {pid: FALLBACK_START_PROBABILITY for pid in xi}
+
+    complete = bench_config_for_xi(OPTIMISER, xi, probs, positions)
+    del probs[5]
+    with_a_hole = bench_config_for_xi(OPTIMISER, xi, probs, positions)
+    assert with_a_hole.bench_slot_weights == pytest.approx(complete.bench_slot_weights)
+
+
+def test_the_primitives_refuse_a_non_finite_input():
+    """Defence in depth. After the boundary sanitises, these can only be
+    reached with a NaN by a caller that skipped it — and then the failure must
+    be loud rather than `(nan, nan, nan)` or a keeper worth 0.0."""
+    with pytest.raises(ValueError):
+        derive_slot_weights([0.9, float("nan"), 0.8])
+    with pytest.raises(ValueError):
+        derive_gk_weight(float("nan"))
+    with pytest.raises(ValueError):
+        derive_gk_weight(float("inf"))
+
+
+def test_a_probability_outside_zero_to_one_is_clamped_not_negated():
+    """`1 - p` for p > 1 is a negative blank chance, which makes the
+    Poisson-binomial convolution produce weights outside [0, 1] and the ILP
+    nonsense. Clamp rather than trust the upstream column."""
+    from config.strategy import OPTIMISER
+    from optimiser.bench_weights import bench_config_for_xi
+
+    xi = list(range(1, 12))
+    positions = {pid: ("GKP" if pid == 1 else "MID") for pid in xi}
+    probs = {pid: 0.9 for pid in xi}
+    probs[5] = 1.4
+    out = bench_config_for_xi(OPTIMISER, xi, probs, positions)
+    assert all(0.0 <= w <= 1.0 for w in out.bench_slot_weights)
