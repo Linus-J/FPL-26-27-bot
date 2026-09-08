@@ -1,5 +1,6 @@
 import logging
 import pickle
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -88,6 +89,40 @@ def _load_training_data() -> pd.DataFrame:
         return df
     finally:
         db.close()
+
+
+SEASON_RE = re.compile(r"^\d{4}-\d{2}$")
+
+
+def rows_strictly_before(df: pd.DataFrame, season: str, gameweek: int) -> pd.DataFrame:
+    """Every row chronologically before ``(season, gameweek)`` — earlier
+    seasons in full, plus this season up to but excluding ``gameweek``.
+
+    ``_load_training_data`` has no season filter of any kind (its only WHERE
+    clause is ``s.minutes IS NOT NULL``), so anything walking a completed
+    season forward must apply this itself or it trains on seasons that had not
+    happened yet. This is the single implementation of that cut; A9 validated
+    it against three independent leakage checks before using it to decide the
+    live training set, so do not write a second one.
+
+    Season labels are ``YYYY-YY``, which sort lexicographically in
+    chronological order, so the plain string comparison is the chronological
+    one. That is only true while every label matches, hence the assertion —
+    a silently-wrong comparison here is leakage, and leakage that inflates
+    results is the kind nobody goes looking for.
+    """
+    if not SEASON_RE.match(season):
+        raise ValueError(f"season must look like 'YYYY-YY', got {season!r}")
+    bad = sorted({s for s in df["season"].unique() if not SEASON_RE.match(str(s))})
+    if bad:
+        raise ValueError(
+            f"cannot order seasons chronologically by string comparison; "
+            f"these do not look like 'YYYY-YY': {bad}"
+        )
+    return df[
+        (df["season"] < season)
+        | ((df["season"] == season) & (df["gameweek"] < gameweek))
+    ].copy()
 
 
 def _trailing_dnp_streak(minutes: pd.Series) -> pd.Series:
@@ -411,8 +446,19 @@ def train(
     save: bool = True,
     df_override: pd.DataFrame | None = None,
     fast: bool = False,
+    before: tuple[str, int] | None = None,
 ) -> Pipeline:
+    """Fit the three-way minutes-band model.
+
+    ``before=(season, gameweek)`` trains on all history strictly before that
+    point — what a walk-forward simulation needs, since the loaded frame spans
+    every season including ones after the gameweek being simulated. Live
+    serving passes nothing and trains on everything, which is the same thing
+    when "everything" already ends at the present.
+    """
     df = df_override if df_override is not None else _load_training_data()
+    if before is not None:
+        df = rows_strictly_before(df, *before)
     df = _build_features(df)
 
     y = df["minutes"].apply(minutes_band)

@@ -524,8 +524,17 @@ def run_backtest(
                 "GW%d: cold-start projections (%d current-season history rows)", gw, len(history)
             )
         else:
-            logger.info("GW%d: training minutes model on %d rows...", gw, len(history))
-            minutes_model = train_minutes(df_override=history, save=False, fast=True)
+            # A9: all history strictly before this gameweek, matching what the
+            # live path trains on. `history` is this season's rows only, which
+            # is the arm that measurably predicts minutes worse (+0.0113 log
+            # loss over 103 held-out gameweeks) and is not what the bot runs.
+            # `before=` is not optional: the loaded frame has no season filter,
+            # so without it this would train on seasons after `gw`.
+            logger.info(
+                "GW%d: training minutes model on all history before %s GW%d "
+                "(%d current-season rows of it)...", gw, season, gw, len(history),
+            )
+            minutes_model = train_minutes(before=(season, gw), save=False, fast=True)
 
             projections = _build_gw_projections(
                 history=history,
@@ -914,7 +923,8 @@ def run_naive_xi_backtest(
             logger.warning("GW%d: no player snapshot, skipping", gw)
             continue
 
-        minutes_model = train_minutes(df_override=history, save=False, fast=True)
+        # A9: same as run_backtest — all history strictly before (season, gw).
+        minutes_model = train_minutes(before=(season, gw), save=False, fast=True)
         projections = _build_gw_projections(
             history=history, players=players,
             minutes_model=minutes_model,
@@ -1064,7 +1074,8 @@ def run_rebuild_backtest(
             logger.warning("GW%d: no player snapshot, skipping", gw)
             continue
 
-        minutes_model = train_minutes(df_override=history, save=False, fast=True)
+        # A9: same as run_backtest — all history strictly before (season, gw).
+        minutes_model = train_minutes(before=(season, gw), save=False, fast=True)
         sample_rows: list = []
         projections = _build_gw_projections(
             history=history, players=players, minutes_model=minutes_model,
