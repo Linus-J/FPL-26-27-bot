@@ -1,5 +1,6 @@
 import logging
 import pickle
+from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
@@ -473,7 +474,14 @@ def _bands_frame(all_stats: pd.DataFrame, model: Pipeline | None) -> pd.DataFram
     """Feature-build + 3-way predict + availability override, per input row."""
     if model is None:
         model = load()
-    df = _build_features(all_stats).copy()
+    return _predict_bands(_build_features(all_stats).copy(), model)
+
+
+def _predict_bands(df: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
+    """The predict half of ``_bands_frame``, over an ALREADY-BUILT feature
+    frame. Split out (A8) so the horizon path can vary a built frame's
+    gameweek-keyed columns before predicting, without a second feature-build
+    that could drift from ``_build_features``."""
     # Features that were constant while the model was fitted must stay at that
     # constant here, or the current season's newly-populated enrichment would
     # be fed to a model that never saw it vary. See _degenerate_features.
@@ -521,6 +529,82 @@ def predict_minutes_bands(
     df = _bands_frame(all_stats, model)
     last = df.groupby("player_id")[["_p0", "_p1", "_p2"]].last()
     return {int(pid): (r["_p0"], r["_p1"], r["_p2"]) for pid, r in last.iterrows()}
+
+
+def predict_minutes_bands_by_gameweek(
+    all_stats: pd.DataFrame,
+    model: Pipeline | None,
+    target_gws: Sequence[int],
+    season: str | None = None,
+) -> dict[tuple[int, int], tuple[float, float, float]]:
+    """Per (player, gameweek) → (P(0 min), P(1–59), P(60+)), for each gameweek
+    in ``target_gws``.
+
+    ``predict_minutes_bands`` above answers "what will this player do next?"
+    with ONE number, and ``assemble_gw_projections`` then read that same number
+    for every gameweek in its horizon. So a post-international break at GW6, or
+    a Champions League tie the Tuesday before GW7, could not move a projection
+    that had already been decided at GW3's fixture. Measured on the live
+    database: 0 of 615 players varied across GW4-GW8. This function is the
+    per-gameweek answer; the scalar one is kept for callers that genuinely want
+    "next match".
+
+    **The train/serve asymmetry, stated rather than hidden.** Only the
+    gameweek-keyed calendar features are recomputed per gameweek — the
+    congestion block, which comes from ``team_matches`` and is known in advance
+    for every fixture already scheduled. Everything history-derived (the
+    rolling minutes/points/starts averages, the DNP streak, the red-card
+    suspension flag, price and ownership, the FDR and odds merges) is FROZEN at
+    its as-of ``target_gws[0]`` value and broadcast across the horizon. At
+    training time every row used those rolling features as-of its OWN gameweek,
+    so GW5-GW8 are served from strictly staler inputs than the model was fitted
+    on.
+
+    That asymmetry is unavoidable and must not be "fixed" by forecasting the
+    rolling features: GW5's rolling average is a function of GW4's outcome,
+    which does not exist yet. Inventing one would be a leak in the backtest and
+    a fabrication live. The honest shape is a frozen history plus a real
+    calendar, which is what this does.
+    """
+    if model is None:
+        model = load()
+    target_gws = [int(gw) for gw in target_gws]
+    if not target_gws:
+        return {}
+
+    built = _build_features(all_stats).copy()
+    if built.empty:
+        return {}
+
+    # The as-of row: each player's most recent built row, exactly the row
+    # ``predict_minutes_bands`` would have collapsed to.
+    asof = (
+        built.sort_values(["player_id", "season", "gameweek"])
+        .drop_duplicates(subset="player_id", keep="last")
+    )
+    # ``season`` is None on the backtest path, which walks one season at a time
+    # -- the frame's own latest season is that season.
+    season = season or str(asof["season"].max())
+
+    congestion = load_congestion()
+    frames = []
+    for gw in target_gws:
+        frame = asof.copy()
+        frame["gameweek"] = gw
+        frame["season"] = season
+        frame = frame.drop(columns=CONGESTION_FEATURE_COLS, errors="ignore")
+        frames.append(add_congestion_features(frame, congestion))
+    horizon = pd.concat(frames, ignore_index=True)
+
+    scored = _predict_bands(horizon, model)
+    # name=None keeps these plain tuples: itertuples' namedtuple would rename
+    # the leading-underscore band columns to positional _1/_2/_3.
+    return {
+        (int(pid), int(gw)): (float(p0), float(p1), float(p2))
+        for pid, gw, p0, p1, p2 in scored[
+            ["player_id", "gameweek", "_p0", "_p1", "_p2"]
+        ].itertuples(index=False, name=None)
+    }
 
 
 def predict_batch(

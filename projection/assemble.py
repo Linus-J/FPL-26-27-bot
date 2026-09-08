@@ -39,7 +39,7 @@ from projection import bonus as bonus_mod
 from projection import clean_sheets, defcon, goals, saves
 from projection.assists import ASSIST_FRACTION, expected_assist_points
 from projection.covariance import sample_team_goals, split_multinomial
-from projection.minutes_model import predict_minutes_bands
+from projection.minutes_model import predict_minutes_bands_by_gameweek
 from projection.team_goals import (
     NEUTRAL_LAMBDA_AWAY,
     NEUTRAL_LAMBDA_HOME,
@@ -818,10 +818,18 @@ def assemble_gw_projections(
         target_gw=target_gw,
         prior_rates=prior_rates,
     )
-    bands = predict_minutes_bands(history, minutes_model)
-
     rng = np.random.default_rng(seed)
     target_gws = list(range(target_gw, target_gw + horizon))
+    # A8: keyed on (player_id, gameweek). This used to be a single
+    # dict[player_id -> bands] read unchanged on every iteration of the loop
+    # below, so start_probability was byte-identical across the whole horizon
+    # and the fixture-congestion features could not reach the one place they
+    # were built for. The rolling half of the feature vector is still frozen
+    # as-of target_gw -- see predict_minutes_bands_by_gameweek's docstring for
+    # why that asymmetry is the honest shape rather than an oversight.
+    bands_by_gw = predict_minutes_bands_by_gameweek(
+        history, minutes_model, target_gws, season=season
+    )
     # P12: dedupe on the fixture's own identity, NOT just (player_id, gameweek)
     # -- a genuine double-gameweek player has TWO real rows here (same
     # gameweek, different opponent_team_id/was_home), and both must survive
@@ -840,6 +848,10 @@ def assemble_gw_projections(
         gw_fixtures = fixture_rows[fixture_rows["gameweek"] == gw]
         if gw_fixtures.empty:
             continue
+        # This gameweek's slice. Both consumers below (_player_dicts and the
+        # per-fixture p2 lookup) keep their player-keyed contract, including
+        # the (0.5, 0.0, 0.5) fallback for a player the minutes model dropped.
+        bands = {pid: b for (pid, band_gw), b in bands_by_gw.items() if band_gw == gw}
         odds_gw = match_odds[match_odds["gameweek"] == gw]
         home_side = gw_fixtures[gw_fixtures["was_home"]]
         pairs = home_side[["team_id_season", "opponent_team_id"]].drop_duplicates()

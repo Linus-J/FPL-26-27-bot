@@ -26,6 +26,24 @@ from projection import assemble
 VALUE_BY_PID = {1: 5.0, 2: 7.0, 3: 9.0}
 
 
+def _by_gameweek(bands: dict):
+    """Adapt a player-keyed stub to A8's (player_id, gameweek) contract.
+
+    The production signature is
+    ``predict_minutes_bands_by_gameweek(history, model, target_gws, season=...)``
+    and it returns one entry per player PER GAMEWEEK. These tests do not care
+    which gameweek a band came from, so the same bands are repeated across the
+    horizon -- exactly the behaviour A8 removed from production, kept here
+    deliberately so these tests keep isolating the DGW/persistence logic."""
+    def _stub(history, model, target_gws, season=None):
+        return {
+            (pid, int(gw)): band
+            for gw in target_gws
+            for pid, band in bands.items()
+        }
+    return _stub
+
+
 @pytest.fixture
 def session(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'dgw.db'}")
@@ -84,8 +102,8 @@ def _fake_sample_fixture(rng, home_players, away_players, lam_home, lam_away, n,
 
 def _patch_minutes_and_sampling(monkeypatch):
     monkeypatch.setattr(
-        assemble, "predict_minutes_bands",
-        lambda history, model: dict.fromkeys(range(1, 4), (0.0, 0.0, 1.0)),
+        assemble, "predict_minutes_bands_by_gameweek",
+        _by_gameweek(dict.fromkeys(range(1, 4), (0.0, 0.0, 1.0))),
     )
     monkeypatch.setattr(assemble, "sample_fixture", _fake_sample_fixture)
 
@@ -117,8 +135,8 @@ def test_dgw_player_gets_both_fixtures_summed_into_one_row(monkeypatch):
 
 def test_dgw_player_start_probability_is_p_at_least_one(monkeypatch):
     monkeypatch.setattr(
-        assemble, "predict_minutes_bands",
-        lambda history, model: {1: (0.4, 0.0, 0.6), 2: (0.0, 0.0, 1.0), 3: (0.0, 0.0, 1.0)},
+        assemble, "predict_minutes_bands_by_gameweek",
+        _by_gameweek({1: (0.4, 0.0, 0.6), 2: (0.0, 0.0, 1.0), 3: (0.0, 0.0, 1.0)}),
     )
     monkeypatch.setattr(assemble, "sample_fixture", _fake_sample_fixture)
     out = assemble.assemble_gw_projections(
@@ -178,8 +196,8 @@ def test_single_gameweek_player_unaffected(monkeypatch):
 
 def _run(monkeypatch, bands=None):
     monkeypatch.setattr(
-        assemble, "predict_minutes_bands",
-        lambda history, model: bands or dict.fromkeys(range(1, 4), (0.0, 0.0, 1.0)),
+        assemble, "predict_minutes_bands_by_gameweek",
+        _by_gameweek(bands or dict.fromkeys(range(1, 4), (0.0, 0.0, 1.0))),
     )
     monkeypatch.setattr(assemble, "sample_fixture", _fake_sample_fixture)
     return assemble.assemble_gw_projections(

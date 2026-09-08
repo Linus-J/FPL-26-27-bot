@@ -66,12 +66,26 @@ def _match_odds():
     ])
 
 
+
+def _by_gameweek(bands: dict):
+    """Adapt a player-keyed stub to A8's (player_id, gameweek) contract --
+    the same bands repeated across the horizon, so these tests keep isolating
+    persistence and scenario offsets rather than the minutes model."""
+    def _stub(history, model, target_gws, season=None):
+        return {
+            (pid, int(gw)): band
+            for gw in target_gws
+            for pid, band in bands.items()
+        }
+    return _stub
+
+
 def _assemble_with(assemble_module, monkeypatch, **kwargs):
     """Same call as the persist_samples test, with only the sink/persist
     flags differing, so the two routes cannot drift apart."""
     monkeypatch.setattr(
-        assemble_module, "predict_minutes_bands",
-        lambda history, model: dict.fromkeys(range(1, 7), (0.0, 0.0, 1.0)),
+        assemble_module, "predict_minutes_bands_by_gameweek",
+        _by_gameweek(dict.fromkeys(range(1, 7), (0.0, 0.0, 1.0))),
     )
 
     def fake_sample_fixture(rng, home_players, away_players, lam_home, lam_away, n, shares):
@@ -125,8 +139,8 @@ def test_sample_sink_requires_season(monkeypatch):
 def test_persist_samples_writes_disjoint_scenario_ranges_per_fixture(session, monkeypatch):
     n_scenarios = 4
     monkeypatch.setattr(
-        assemble, "predict_minutes_bands",
-        lambda history, model: dict.fromkeys(range(1, 7), (0.0, 0.0, 1.0)),
+        assemble, "predict_minutes_bands_by_gameweek",
+        _by_gameweek(dict.fromkeys(range(1, 7), (0.0, 0.0, 1.0))),
     )
 
     def fake_sample_fixture(rng, home_players, away_players, lam_home, lam_away, n, shares):
@@ -161,8 +175,8 @@ def test_persist_samples_writes_disjoint_scenario_ranges_per_fixture(session, mo
 
 def test_persist_samples_off_by_default_writes_nothing(session, monkeypatch):
     monkeypatch.setattr(
-        assemble, "predict_minutes_bands",
-        lambda history, model: dict.fromkeys(range(1, 7), (0.0, 0.0, 1.0)),
+        assemble, "predict_minutes_bands_by_gameweek",
+        _by_gameweek(dict.fromkeys(range(1, 7), (0.0, 0.0, 1.0))),
     )
     monkeypatch.setattr(
         assemble, "sample_fixture",
