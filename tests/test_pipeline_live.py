@@ -10,6 +10,7 @@ about the live-specific plumbing around it.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -170,16 +171,26 @@ def test_run_projections_cold_start_returns_empty_not_crash(session):
 
 
 # ---------------------------------------------------------------------------
-# Training-set choice (A6, 2026-09-08)
+# Training-set choice (A9, 2026-09-08)
 # ---------------------------------------------------------------------------
+#
+# A6 made this choice conditional on the current-season frame's row count, and
+# then on whether the European congestion features varied in it. Both gates are
+# gone: the minutes model trains on all available history, always. See the note
+# above ``run_projections``'s call to ``train_minutes`` for the measurement.
+#
+# The tests below pin the OUTCOME through ``run_projections`` itself, not the
+# source text of the module -- ``tests/test_transfer_banking.py:420`` greps
+# module source, and that is exactly how an earlier defect on this branch
+# survived review.
 
 
 def _built_frame(rows: int, euro: list[float]) -> pd.DataFrame:
-    """A frame shaped like ``_build_features``'s output, only as far as the
-    training-set gate reads it: a row count and the congestion columns.
+    """A frame shaped like ``_build_features``'s output, only as far as
+    ``run_projections`` reads it: a row count and the congestion columns.
 
     ``euro`` is tiled across the rows. The flag and the tier co-vary in real
-    data — the tier is only non-zero on a week the flag is set — so they are
+    data -- the tier is only non-zero on a week the flag is set -- so they are
     set together here rather than independently.
     """
     from projection.congestion import CONGESTION_FEATURE_COLS
@@ -194,7 +205,8 @@ def _built_frame(rows: int, euro: list[float]) -> pd.DataFrame:
 
 
 def _stub_everything_after_the_gate(monkeypatch, built: pd.DataFrame) -> dict:
-    """Record what the gate hands ``train_minutes`` and cut the run short."""
+    """Record what ``run_projections`` hands ``train_minutes`` and cut the run
+    short."""
     from projection import assemble
 
     seen: dict = {}
@@ -218,37 +230,97 @@ def _stub_everything_after_the_gate(monkeypatch, built: pd.DataFrame) -> dict:
     return seen
 
 
-def test_a_varying_european_feature_keeps_training_on_the_current_season(monkeypatch):
-    """The row-count gate's existing behaviour, unchanged: plenty of rows and
-    nothing degenerate means the current season trains the model."""
+def test_a_healthy_current_season_frame_is_still_not_the_training_set(monkeypatch):
+    """1200 rows and every European feature varying -- the frame that used to
+    win the old gate outright and become ``df_override``.
+
+    Measured on 103 held-out gameweeks across 2023-24, 2024-25 and 2025-26
+    (59,246 player-gameweeks): training on the current season alone costs
+    +0.0113 log loss and +0.0025 Brier against training on all history, and is
+    worse in 79 of the 103. A frame being large and non-degenerate does not make
+    it the better training set.
+    """
     built = _built_frame(1200, euro=[0.0, 1.0])
     seen = _stub_everything_after_the_gate(monkeypatch, built)
 
     pipeline.run_projections(season="2026-27", horizon=1, persist=False)
 
-    assert seen.get("df_override") is not None, "current-season frame should be used"
+    assert "df_override" not in seen, (
+        "the minutes model must train on all available history, never on the "
+        f"current season's frame alone; got df_override={seen.get('df_override')}"
+    )
+    assert seen == {"save": False, "fast": True}
 
 
-def test_a_constant_european_feature_sends_training_to_full_history(monkeypatch):
-    """The trap this task exists to avoid.
+def test_a_european_tie_being_played_cannot_change_the_training_set(monkeypatch):
+    """The defect this task exists to remove.
 
-    1076 current-season rows clear the 1000-row threshold, so the live model
-    trains on 2026-27 alone -- a season whose first European tie is still
-    unplayed. Both European features are then constant zero across every
-    training row, ``_degenerate_features`` records them, and ``_pin_degenerate``
-    holds them at zero at serve time. The feature would be dead in exactly the
-    week it was built for, with every test passing.
-
-    Row count is a proxy for "is this frame informative", and it is the wrong
-    proxy the moment a feature's signal is seasonal.
+    Under the old gate the training set flipped the first time a European tie
+    landed inside a gameweek's ``euro_match_in_prev_7d`` window -- 2026-27's is
+    2026-09-08 18:45, inside GW4's -- with no code change and nothing in the
+    cron log saying why 152 of 615 players' ``start_probability`` had moved by
+    more than 0.10. The two frames below differ in exactly that way and must
+    produce the same training set.
     """
-    built = _built_frame(1200, euro=[0.0])
-    seen = _stub_everything_after_the_gate(monkeypatch, built)
+    calls = []
+    for euro in ([0.0], [0.0, 1.0]):
+        seen = _stub_everything_after_the_gate(monkeypatch, _built_frame(1200, euro=euro))
+        pipeline.run_projections(season="2026-27", horizon=1, persist=False)
+        calls.append(dict(seen))
+
+    assert calls[0] == calls[1], (
+        "a European tie having been played changed the training set: "
+        f"{calls[0]} vs {calls[1]}"
+    )
+
+
+def test_a_thin_current_season_frame_also_trains_on_full_history(monkeypatch):
+    """Early-season behaviour is preserved, not changed: the sub-1000-row branch
+    already trained on all history, and still does."""
+    seen = _stub_everything_after_the_gate(monkeypatch, _built_frame(40, euro=[0.0, 1.0]))
 
     pipeline.run_projections(season="2026-27", horizon=1, persist=False)
 
-    assert seen.get("df_override") is None, (
-        "a current-season frame in which a European feature never varies must "
-        "not be the training set: the model would learn nothing from it and "
-        "then be pinned to zero at serve time"
+    assert "df_override" not in seen
+    assert seen == {"save": False, "fast": True}
+
+
+def test_no_usable_rows_still_routes_to_the_cold_start(monkeypatch):
+    """NOT part of the gate removed here. A season with exactly one played
+    gameweek has played history but no usable rows (every row is a first
+    appearance, so the shifted rolling features are null and all rows drop),
+    and there is nothing to fit OR to serve from. It routes to the cold start's
+    prior-season evidence. Killed run_agent live at GW2 of 2026-27 on
+    2026-08-25; must survive the gate removal.
+    """
+    seen = _stub_everything_after_the_gate(monkeypatch, _built_frame(0, euro=[0.0]))
+    cold = pd.DataFrame({
+        "player_id": [1], "gameweek": [4], "xpts": [3.0],
+        "xpts_mean": [3.0], "xpts_var": [1.0], "start_probability": [0.8],
+    })
+    monkeypatch.setattr(
+        pipeline, "cold_start_projections", lambda *a, **k: (cold, None, None)
+    )
+
+    out = pipeline.run_projections(season="2026-27", horizon=1, persist=False)
+
+    assert seen == {}, "no model may be trained when there is nothing to fit"
+    assert out.equals(cold)
+
+
+def test_the_chosen_training_set_is_named_in_the_log(monkeypatch, caplog):
+    """A change of training set must be visible to an operator reading a cron
+    log. It cannot vary between runs any more, but the line still has to say
+    which arm ran and how much of it the current season accounts for --
+    silent 0.2 swings in ``start_probability`` are how the old flip went
+    unnoticed."""
+    _stub_everything_after_the_gate(monkeypatch, _built_frame(1200, euro=[0.0, 1.0]))
+
+    with caplog.at_level(logging.INFO, logger="projection.pipeline"):
+        pipeline.run_projections(season="2026-27", horizon=1, persist=False)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("all available history" in m and "1200" in m for m in messages), (
+        f"no log line names the training set and the current season's share of "
+        f"it; got {messages}"
     )
