@@ -219,6 +219,33 @@ def season_has_played_history(season: str) -> bool:
 # clears the degenerate early-season case without displacing a real season.
 MIN_CURRENT_SEASON_TRAINING_ROWS = 1000
 
+# Features whose signal is SEASONAL, so that a row count alone cannot tell you
+# whether the current-season frame is informative about them (A6, 2026-09-08).
+#
+# Measured on the live database on 2026-09-08: 1076 current-season rows clear
+# the threshold above, so the model trains on 2026-27 alone -- and 2026-27's
+# first European tie had not been played. Both European features were therefore
+# constant zero across every training row, which makes _degenerate_features
+# record them and _pin_degenerate hold them at zero at serve time. Correct
+# behaviour, given that training set; the wrong training set.
+#
+# The fix is not to weaken the pin. It is to stop choosing a frame the pin will
+# have to neutralise, by asking whether the frame VARIES rather than only
+# whether it is large. Falling through to full history is safe even when the
+# feature is constant there too: _degenerate_features pins it either way.
+REQUIRED_VARYING_FEATURE_COLS = (
+    "euro_match_in_prev_7d",
+    "euro_competition_tier",
+)
+
+
+def _degenerate_required_features(built: pd.DataFrame) -> list[str]:
+    """Which of REQUIRED_VARYING_FEATURE_COLS never vary on this built frame."""
+    return [
+        col for col in REQUIRED_VARYING_FEATURE_COLS
+        if col in built.columns and built[col].nunique(dropna=False) <= 1
+    ]
+
 
 def run_projections(
     season: str = "2026-27",
@@ -299,7 +326,8 @@ def run_projections(
     # and leave the decision path alone: existing squad, transfer optimiser,
     # chip logic, all unchanged. Resolves itself at GW3, when the second
     # played gameweek gives every row a predecessor.
-    usable = len(_minutes_features(history))
+    built = _minutes_features(history)
+    usable = len(built)
     if usable == 0:
         logger.warning(
             "%s has played gameweeks but none survive feature-building (%d rows "
@@ -315,12 +343,22 @@ def run_projections(
             persist_projections(projections_df)
         return projections_df
 
+    degenerate = _degenerate_required_features(built)
     if usable < MIN_CURRENT_SEASON_TRAINING_ROWS:
         logger.warning(
             "Only %d of %d current-season rows survive feature-building (need "
             "%d) -- too early in %s to train the minutes model on it alone. "
             "Training on all available history instead.",
             usable, len(history), MIN_CURRENT_SEASON_TRAINING_ROWS, season,
+        )
+        min_model = train_minutes(save=False, fast=True)
+    elif degenerate:
+        logger.warning(
+            "%s has %d usable rows, enough to train on alone, but %s never "
+            "vary in them -- the model would learn nothing from those features "
+            "and they would then be pinned at their constant when serving. "
+            "Training on all available history instead.",
+            season, usable, sorted(degenerate),
         )
         min_model = train_minutes(save=False, fast=True)
     else:

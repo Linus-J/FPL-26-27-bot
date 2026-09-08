@@ -11,6 +11,11 @@ from sklearn.preprocessing import StandardScaler
 from sqlalchemy import text
 
 from data.db import get_session
+from projection.congestion import (
+    CONGESTION_FEATURE_COLS,
+    add_congestion_features,
+    load_congestion,
+)
 from projection.features import (
     ENRICHMENT_FEATURE_COLS,
     FDR_FEATURE_COLS,
@@ -40,6 +45,11 @@ def _load_training_data() -> pd.DataFrame:
                 s.gameweek,
                 s.season,
                 s.opponent_team_id,
+                -- The club the player turned out for THAT season. p.team_id
+                -- below is where they play NOW, so keying the congestion merge
+                -- on it would file a transferred player's older seasons
+                -- against their current club's calendar (A6).
+                s.team_id_season,
                 s.minutes,
                 s.total_points,
                 s.goals_scored,
@@ -189,6 +199,13 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     odds = load_fixture_odds()
     df = add_odds_features(df, odds)
 
+    # A6: fixture congestion — rest days, the fortnight's match count, and
+    # whether the week contained European football. Merged here, inside the ONE
+    # function train() and _bands_frame() both call, so the train and serve
+    # frames cannot diverge.
+    congestion = load_congestion()
+    df = add_congestion_features(df, congestion)
+
     return df
 
 
@@ -214,6 +231,7 @@ FEATURE_COLS = [
     *FDR_FEATURE_COLS,
     *ODDS_FEATURE_COLS,
     *ENRICHMENT_FEATURE_COLS,
+    *CONGESTION_FEATURE_COLS,
 ]
 
 assert_rate_only(FEATURE_COLS)

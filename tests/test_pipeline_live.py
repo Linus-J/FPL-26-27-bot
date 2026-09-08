@@ -167,3 +167,88 @@ def test_run_projections_cold_start_returns_empty_not_crash(session):
     assert set(out.columns) == {
         "player_id", "gameweek", "xpts", "xpts_mean", "xpts_var", "start_probability",
     }
+
+
+# ---------------------------------------------------------------------------
+# Training-set choice (A6, 2026-09-08)
+# ---------------------------------------------------------------------------
+
+
+def _built_frame(rows: int, euro: list[float]) -> pd.DataFrame:
+    """A frame shaped like ``_build_features``'s output, only as far as the
+    training-set gate reads it: a row count and the congestion columns.
+
+    ``euro`` is tiled across the rows. The flag and the tier co-vary in real
+    data — the tier is only non-zero on a week the flag is set — so they are
+    set together here rather than independently.
+    """
+    from projection.congestion import CONGESTION_FEATURE_COLS
+
+    df = pd.DataFrame({"player_id": range(rows), "gameweek": [3] * rows})
+    for col in CONGESTION_FEATURE_COLS:
+        df[col] = 0.0
+    flags = (euro * rows)[:rows]
+    df["euro_match_in_prev_7d"] = flags
+    df["euro_competition_tier"] = [f * 3.0 for f in flags]
+    return df
+
+
+def _stub_everything_after_the_gate(monkeypatch, built: pd.DataFrame) -> dict:
+    """Record what the gate hands ``train_minutes`` and cut the run short."""
+    from projection import assemble
+
+    seen: dict = {}
+
+    def fake_train(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(pipeline, "train_minutes", fake_train)
+    monkeypatch.setattr(pipeline, "_get_current_and_next_gw", lambda: (3, 4))
+    monkeypatch.setattr(pipeline, "_minutes_features", lambda df: built)
+    monkeypatch.setattr(
+        assemble, "load_all_stats",
+        lambda season: pd.DataFrame({"player_id": [1], "gameweek": [3], "season": [season]}),
+    )
+    monkeypatch.setattr(pipeline, "_build_live_fixture_context", lambda s, g: pd.DataFrame())
+    monkeypatch.setattr(pipeline, "_load_live_match_odds", lambda s, g: pd.DataFrame())
+    monkeypatch.setattr(assemble, "load_defcon_events", lambda s: pd.DataFrame())
+    monkeypatch.setattr(assemble, "compute_defcon_field_shares", lambda s: {})
+    monkeypatch.setattr(assemble, "assemble_gw_projections", lambda **kw: pd.DataFrame())
+    return seen
+
+
+def test_a_varying_european_feature_keeps_training_on_the_current_season(monkeypatch):
+    """The row-count gate's existing behaviour, unchanged: plenty of rows and
+    nothing degenerate means the current season trains the model."""
+    built = _built_frame(1200, euro=[0.0, 1.0])
+    seen = _stub_everything_after_the_gate(monkeypatch, built)
+
+    pipeline.run_projections(season="2026-27", horizon=1, persist=False)
+
+    assert seen.get("df_override") is not None, "current-season frame should be used"
+
+
+def test_a_constant_european_feature_sends_training_to_full_history(monkeypatch):
+    """The trap this task exists to avoid.
+
+    1076 current-season rows clear the 1000-row threshold, so the live model
+    trains on 2026-27 alone -- a season whose first European tie is still
+    unplayed. Both European features are then constant zero across every
+    training row, ``_degenerate_features`` records them, and ``_pin_degenerate``
+    holds them at zero at serve time. The feature would be dead in exactly the
+    week it was built for, with every test passing.
+
+    Row count is a proxy for "is this frame informative", and it is the wrong
+    proxy the moment a feature's signal is seasonal.
+    """
+    built = _built_frame(1200, euro=[0.0])
+    seen = _stub_everything_after_the_gate(monkeypatch, built)
+
+    pipeline.run_projections(season="2026-27", horizon=1, persist=False)
+
+    assert seen.get("df_override") is None, (
+        "a current-season frame in which a European feature never varies must "
+        "not be the training set: the model would learn nothing from it and "
+        "then be pinned to zero at serve time"
+    )

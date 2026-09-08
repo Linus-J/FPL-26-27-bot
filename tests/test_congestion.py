@@ -376,3 +376,159 @@ def test_no_warning_when_the_calendar_is_sound(caplog):
             ("2025-26", 1, datetime(2025, 10, 4, 15, 0), "PL"),
         ]))
     assert caplog.text == ""
+
+
+# ---------------------------------------------------------------------------
+# Wiring the features into the model (A6, 2026-09-08)
+#
+# congestion.py was complete, tested and imported by nothing. These tests pin
+# the join itself, because the join is where this codebase has twice turned a
+# real feature into a constant: ``press_sentiment`` and ``btts_prob`` both
+# reached production reading a default on every served row.
+# ---------------------------------------------------------------------------
+
+
+def _congestion_rows(rows: list[tuple]) -> pd.DataFrame:
+    """(season, team_id, gameweek, days_since, days_to_next, prev14, euro,
+    tier, break_flag) -> the frame ``load_congestion`` returns."""
+    return pd.DataFrame(
+        rows,
+        columns=["season", "team_id", "gameweek", *CONGESTION_FEATURE_COLS],
+    )
+
+
+def test_the_congestion_features_are_actually_model_features():
+    """The whole defect in one assertion: the module existed and FEATURE_COLS
+    did not mention it, so nothing it computed ever reached the model."""
+    from projection.minutes_model import FEATURE_COLS
+
+    missing = [c for c in CONGESTION_FEATURE_COLS if c not in FEATURE_COLS]
+    assert not missing, f"congestion features absent from the model: {missing}"
+
+
+def test_an_unmatched_player_gameweek_is_rested_not_freshly_played():
+    """The likeliest train/serve skew in this change.
+
+    A blanket ``fillna(0.0)`` — which is what both neighbouring merge helpers
+    do for their flags — would tell the model this player played YESTERDAY and
+    has a match TOMORROW. The honest default for "no calendar row" is the
+    module's own cap: fully rested.
+    """
+    from projection.congestion import REST_CAP_DAYS, add_congestion_features
+
+    df = pd.DataFrame([
+        {"player_id": 1, "season": "2026-27", "gameweek": 5, "team_id_season": 99},
+    ])
+    merged = add_congestion_features(df, _congestion_rows([]))
+
+    assert merged.loc[0, "days_since_last_match"] == REST_CAP_DAYS
+    assert merged.loc[0, "days_to_next_match"] == REST_CAP_DAYS
+    assert merged.loc[0, "matches_in_prev_14d"] == 0.0
+    assert merged.loc[0, "euro_match_in_prev_7d"] == 0.0
+    assert merged.loc[0, "euro_competition_tier"] == 0.0
+    assert merged.loc[0, "is_post_international_break"] == 0.0
+
+
+def test_the_merge_keys_on_the_season_correct_club():
+    """Two clubs, one gameweek: each must get its own congestion, and the key
+    must be the club the player played for THAT season."""
+    from projection.congestion import add_congestion_features
+
+    df = pd.DataFrame([
+        {"player_id": 1, "season": "2026-27", "gameweek": 5, "team_id_season": 11},
+        {"player_id": 2, "season": "2026-27", "gameweek": 5, "team_id_season": 22},
+    ])
+    cong = _congestion_rows([
+        ("2026-27", 11, 5, 3.0, 4.0, 3.0, 1.0, 3.0, 0.0),
+        ("2026-27", 22, 5, 7.0, 7.0, 1.0, 0.0, 0.0, 0.0),
+    ])
+    merged = add_congestion_features(df, cong).set_index("player_id")
+
+    assert merged.loc[1, "euro_match_in_prev_7d"] == 1.0
+    assert merged.loc[1, "euro_competition_tier"] == 3.0
+    assert merged.loc[2, "euro_match_in_prev_7d"] == 0.0
+    assert merged.loc[1, "days_since_last_match"] == 3.0
+    assert merged.loc[2, "days_since_last_match"] == 7.0
+
+
+def test_the_merge_adds_no_rows_and_drops_none():
+    """A LEFT join on a key the right side duplicates would fan out the
+    training frame. ``_build_features`` has already dropped its unusable rows
+    by this point; a congestion row must not resurrect or remove one."""
+    from projection.congestion import add_congestion_features
+
+    df = pd.DataFrame([
+        {"player_id": 1, "season": "2026-27", "gameweek": 5, "team_id_season": 11},
+        {"player_id": 2, "season": "2026-27", "gameweek": 5, "team_id_season": 11},
+        {"player_id": 3, "season": "2026-27", "gameweek": 6, "team_id_season": 99},
+    ])
+    cong = _congestion_rows([
+        ("2026-27", 11, 5, 3.0, 4.0, 3.0, 1.0, 3.0, 0.0),
+        ("2026-27", 11, 5, 9.9, 9.9, 9.0, 0.0, 0.0, 1.0),  # duplicate key
+    ])
+    merged = add_congestion_features(df, cong)
+
+    assert len(merged) == 3
+    assert list(merged["player_id"]) == [1, 2, 3]
+
+
+def test_a_frame_without_a_club_column_still_gets_every_feature():
+    """``_build_features`` is called on frames that carry no club at all (see
+    test_pipeline_cold_start_gap). Those must come out rested, not missing —
+    a NaN here reaches the scaler and the whole prediction becomes NaN."""
+    from projection.congestion import REST_CAP_DAYS, add_congestion_features
+
+    df = pd.DataFrame([{"player_id": 1, "season": "2026-27", "gameweek": 5}])
+    merged = add_congestion_features(df, _congestion_rows([
+        ("2026-27", 11, 5, 3.0, 4.0, 3.0, 1.0, 3.0, 0.0),
+    ]))
+
+    for col in CONGESTION_FEATURE_COLS:
+        assert col in merged.columns
+        assert merged[col].notna().all()
+    assert merged.loc[0, "days_since_last_match"] == REST_CAP_DAYS
+
+
+def _played(gameweeks: list[int], team_id: int = 11, players: int = 3) -> pd.DataFrame:
+    """A minimal ``player_gw_stats``-shaped frame, the same shape
+    ``test_pipeline_cold_start_gap`` feeds ``_build_features``."""
+    return pd.DataFrame([
+        {
+            "player_id": pid, "season": "2026-27", "gameweek": gw,
+            "minutes": 90, "total_points": 5, "goals_scored": 0, "assists": 0,
+            "clean_sheets": 0, "goals_conceded": 0, "saves": 0,
+            "yellow_cards": 0, "red_cards": 0, "bonus": 0, "bps": 10,
+            "position": "MID", "was_home": 1, "opponent_team_id": 2,
+            "team_id_season": team_id, "team_id": team_id,
+            "now_cost": 5.0, "selected_by_percent": 1.0,
+            "status": "a", "chance_of_playing_next_round": 100,
+        }
+        for pid in range(1, players + 1)
+        for gw in gameweeks
+    ])
+
+
+def test_build_features_feeds_congestion_to_both_train_and_serve(monkeypatch):
+    """``_build_features`` is the single function ``train()`` and
+    ``_bands_frame()`` both call, and both then do ``df[FEATURE_COLS]``. So
+    pinning the columns onto its output — and pinning that the FEATURE_COLS
+    slice of its output is finite — is what makes the two paths provably
+    identical rather than incidentally similar."""
+    from projection import minutes_model
+
+    monkeypatch.setattr(
+        minutes_model, "load_congestion",
+        lambda: _congestion_rows([
+            ("2026-27", 11, 2, 3.0, 4.0, 3.0, 1.0, 3.0, 0.0),
+        ]),
+        raising=False,
+    )
+
+    built = minutes_model._build_features(_played([1, 2]))
+    assert not built.empty
+
+    x = built[minutes_model.FEATURE_COLS].astype(float)
+    assert x["euro_match_in_prev_7d"].eq(1.0).all()
+    assert x["euro_competition_tier"].eq(3.0).all()
+    assert x["days_since_last_match"].eq(3.0).all()
+    assert x.notna().all().all(), "a NaN feature makes the whole prediction NaN"
