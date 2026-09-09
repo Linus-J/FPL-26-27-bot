@@ -4,6 +4,7 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier
@@ -516,6 +517,62 @@ def load() -> Pipeline:
         return pickle.load(f)
 
 
+def _append_asof_rows(all_stats: pd.DataFrame) -> pd.DataFrame:
+    """Append one outcome-free row per player so the served as-of row is built
+    from everything up to and INCLUDING the last completed gameweek.
+
+    ``_build_features`` shifts every rolling column by 1, correctly: a row for
+    gameweek g must not see g's own outcome. At training time that is exactly
+    what is wanted. At serve time it was not, because the last row that exists
+    IS the last completed gameweek, so collapsing to it served features as-of
+    the gameweek BEFORE that. Measured on the live database at 2026-27 GW3:
+    player 716 played 0, 0, 90 minutes and was served ``avg_minutes_3gw =
+    0.000`` against a true as-of-GW3 value of 30.000; player 31 played 90, 78,
+    0 and was served 84.000 against a true 56.000. In both directions the
+    served value equalled the as-of-GW2 value exactly. Every projection the bot
+    served was a gameweek stale, for every player, every week, and nothing
+    logged it.
+
+    Appending a row for the NEXT gameweek moves the shift's window forward by
+    exactly one, so that row -- which is then the as-of row -- summarises the
+    real history through the last completed gameweek.
+
+    The appended row carries no outcome (``minutes``/``total_points``/
+    ``red_cards`` are NaN) and cannot leak: every rolling column is
+    ``shift(1)``-ed, so no row contributes to its own features, and this row is
+    each player's last, so it contributes to no other's either.
+    """
+    if all_stats.empty or "player_id" not in all_stats.columns:
+        return all_stats
+
+    order = ["player_id", "season", "gameweek"]
+    df = all_stats.sort_values(order)
+    nxt = df.drop_duplicates(subset="player_id", keep="last").copy()
+
+    # One shared target gameweek for everyone still active in the latest
+    # season, so the gameweek-keyed features (the congestion block) resolve to
+    # the same real fixture round for all of them -- a player who missed the
+    # last gameweek entirely must still be projected for the next one, not for
+    # the one he already sat out. A player whose history stops in an EARLIER
+    # season keeps that season: the rolling features group by
+    # (player_id, season), so moving him forward a season would blank them.
+    latest = df["season"].max()
+    target = int(df.loc[df["season"] == latest, "gameweek"].max()) + 1
+    current = nxt["season"] == latest
+    nxt.loc[current, "gameweek"] = target
+    nxt.loc[~current, "gameweek"] = nxt.loc[~current, "gameweek"] + 1
+
+    for outcome in ("minutes", "total_points", "red_cards"):
+        if outcome in nxt.columns:
+            nxt[outcome] = np.nan
+
+    return (
+        pd.concat([df, nxt], ignore_index=True)
+        .sort_values(order)
+        .reset_index(drop=True)
+    )
+
+
 def _bands_frame(all_stats: pd.DataFrame, model: Pipeline | None) -> pd.DataFrame:
     """Feature-build + 3-way predict + availability override, per input row."""
     if model is None:
@@ -571,8 +628,11 @@ def predict_minutes_bands(
 ) -> dict[int, tuple[float, float, float]]:
     """Per player → (P(0 min), P(1–59), P(60+)) after the availability override,
     taking each player's latest row. The full distribution the components need
-    (P5 conditions clean sheets on P(60+); appearance points on P1/P2)."""
-    df = _bands_frame(all_stats, model)
+    (P5 conditions clean sheets on P(60+); appearance points on P1/P2).
+
+    The as-of row is the appended, outcome-free one -- see ``_append_asof_rows``
+    for why collapsing to the last REAL row served features a gameweek stale."""
+    df = _bands_frame(_append_asof_rows(all_stats), model)
     last = df.groupby("player_id")[["_p0", "_p1", "_p2"]].last()
     return {int(pid): (r["_p0"], r["_p1"], r["_p2"]) for pid, r in last.iterrows()}
 
@@ -618,12 +678,13 @@ def predict_minutes_bands_by_gameweek(
     if not target_gws:
         return {}
 
-    built = _build_features(all_stats).copy()
+    built = _build_features(_append_asof_rows(all_stats)).copy()
     if built.empty:
         return {}
 
-    # The as-of row: each player's most recent built row, exactly the row
-    # ``predict_minutes_bands`` would have collapsed to.
+    # The as-of row: each player's appended, outcome-free row, exactly the row
+    # ``predict_minutes_bands`` collapses to. Both paths go through
+    # ``_append_asof_rows`` so they cannot disagree about what "as-of" means.
     asof = (
         built.sort_values(["player_id", "season", "gameweek"])
         .drop_duplicates(subset="player_id", keep="last")

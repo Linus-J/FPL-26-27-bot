@@ -230,8 +230,11 @@ def test_the_scalar_api_still_answers_for_the_next_match_only(hermetic):
     bands = mm.predict_minutes_bands(_played(), _RestSensitiveModel())
     assert set(bands) == set(TEAMS)
     assert all(isinstance(k, int) for k in bands)
-    # the last history row is GW3, whose calendar entry is the 5.0-day default
-    assert bands[1][2] == pytest.approx(5.0 / 14.0)
+    # A10: the as-of row is TARGET_GW -- the match about to be played, on its
+    # own 3.0 rest days. It used to be GW3, the match already finished, on the
+    # 5.0-day default; "the next match" answered with the last one's calendar
+    # and with rolling form a gameweek stale. See test_minutes_asof_staleness.
+    assert bands[1][2] == pytest.approx(REST_BY_GW[TARGET_GW] / 14.0)
 
 
 # --- the double gameweek the per-gameweek key had to not break ------------
