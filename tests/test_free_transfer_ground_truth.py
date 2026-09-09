@@ -23,6 +23,11 @@ Live case this was caught on, entry 504618: 1 free transfer into GW2, two
 transfers for a -4 hit there (so the allowance was demonstrably 1), rolling to
 1 for GW3, Free Hit played at GW3 -- and FPL showed **1** for GW4 where the
 bot believed 2.
+
+Corroborated across 3,452 sampled entries, where a hit pins the allowance
+exactly: 269 measurements of the ordinary roll-forward all agreed, and all 13
+measurements of a GW2 Wildcard or Free Hit gave 1 at GW3 where the old rule
+said 2 (8 wildcards, 5 free hits, both chips agreeing).
 """
 
 from __future__ import annotations
