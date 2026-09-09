@@ -32,7 +32,7 @@ from optimiser.chips import (
     Chip,
     ChipRecommendation,
     chips_available_this_half,
-    chips_used_this_season,
+    chips_played_this_season,
     recommend_chip,
 )
 from optimiser.departure_risk import apply_departure_discount
@@ -782,7 +782,14 @@ def _run_decision_cycle(
     ) if bgw_now and squad_ids else 0
 
     decision_log = _load_own_decision_log(sim_manager_id)
-    chips_used = chips_used_this_season(decision_log)
+    # Ground truth from FPL for the real entry; the recommendation log for the
+    # shadow personas, which have no FPL entry to ask about. `team_id` is
+    # already None for them (run_for_persona passes it so), but the condition
+    # is written out because a persona silently inheriting the real squad's
+    # spent chips would look like a plausible result rather than a bug.
+    chips_used = chips_played_this_season(
+        season, decision_log, team_id if sim_manager_id is None else None
+    )
 
     bench_pts = _bench_xpts(squad_ids, projections, next_gw) if squad_ids else 0.0
 

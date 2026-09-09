@@ -785,3 +785,61 @@ class ChipComparisonLog(Base):
     chosen_live: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     chosen_shadow: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ChipUsage(Base):
+    """Chips the real FPL entry has ACTUALLY played, straight from
+    ``/entry/{id}/history/``.
+
+    ``decision_log`` records what the bot RECOMMENDED, which is a different
+    fact. This engine has no submission path (removed 2026-08-18): a human
+    reads the team sheet and enters it, and may decline. Every heuristic in
+    ``optimiser.chips.chips_used_this_season`` -- the de-duplication
+    (2026-08-16), the supersede-by-newer-lineup rule (2026-08-28), the
+    ignore-a-chip-recorded-against-the-gameweek-being-decided rule
+    (2026-09-02) -- exists to reconstruct from recommendations something FPL
+    publishes directly. This table is that fact, and the inference is kept
+    only for the paths that have no real entry to ask about: the backtest and
+    the shadow personas.
+    """
+
+    __tablename__ = "chip_usage"
+    __table_args__ = (
+        UniqueConstraint(
+            "season", "entry_id", "chip", "gameweek", name="uq_chip_usage"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    season: Mapped[str] = mapped_column(String(7), nullable=False)
+    entry_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # FPL's own name: wildcard | freehit | bboost | 3xc. Matches optimiser.chips.Chip.
+    chip: Mapped[str] = mapped_column(String(16), nullable=False)
+    gameweek: Mapped[int] = mapped_column(Integer, nullable=False)
+    played_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    synced_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ChipUsageSync(Base):
+    """"We asked FPL about this entry, and this is when."
+
+    Separate from ``ChipUsage`` because an EMPTY chip list is a real and
+    informative answer -- "nothing played yet" -- and is indistinguishable
+    from "never asked" if the only evidence is a row count. That distinction
+    is the entire point of the table: if the bot recommends a chip and the
+    operator declines it, and it is the season's only chip event, then ground
+    truth is legitimately empty, and a fallback keyed on emptiness would read
+    the recommendation log and report the declined chip as played -- spending
+    it for the rest of the half.
+    """
+
+    __tablename__ = "chip_usage_sync"
+    __table_args__ = (
+        UniqueConstraint("season", "entry_id", name="uq_chip_usage_sync"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    season: Mapped[str] = mapped_column(String(7), nullable=False)
+    entry_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    chips_seen: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    synced_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

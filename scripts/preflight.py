@@ -39,6 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pandas as pd  # noqa: E402
 
+from config.settings import settings  # noqa: E402
+
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
 logger = logging.getLogger(__name__)
@@ -354,7 +356,7 @@ def check_chips_are_reachable(db, result: Result) -> dict:
     from optimiser.chips import (
         _get_wc_half_boundary,
         chips_available_this_half,
-        chips_used_this_season,
+        chips_played_this_season,
         must_play_a_chip_now,
     )
 
@@ -388,7 +390,9 @@ def check_chips_are_reachable(db, result: Result) -> dict:
     log = pd.read_sql(
         text("SELECT gameweek, decision_type, details FROM decision_log"), db.bind
     )
-    used = chips_used_this_season(log)
+    # The engine's own source of truth, or this report drifts from the thing
+    # it is reporting on.
+    used = chips_played_this_season(SEASON, log, settings.fpl_team_id)
     available = chips_available_this_half(used, current_gw, SEASON)
     boundary = _get_wc_half_boundary(SEASON)
     expiry = boundary if current_gw <= boundary else len(per_gw)

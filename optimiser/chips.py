@@ -243,6 +243,98 @@ def chips_used_this_season(decision_log: pd.DataFrame) -> list[tuple[Chip, int]]
     return list(dict.fromkeys(used))
 
 
+
+def chips_played_this_season(
+    season: str,
+    decision_log: pd.DataFrame,
+    entry_id: int | None = None,
+) -> list[tuple[Chip, int]]:
+    """(chip, gameweek) for every chip actually played, from FPL where we can
+    ask it and from the recommendation log where we cannot.
+
+    ``chips_used_this_season`` below reads ``decision_log``, which records what
+    the bot RECOMMENDED. That is not the same fact. This engine has no
+    submission path (removed 2026-08-18): a human reads the team sheet and
+    enters it, and can decline. Every heuristic in that function -- the
+    de-duplication of repeated runs (2026-08-16), the supersede-by-newer-
+    lineup rule (2026-08-28), the ignore-a-row-against-the-gameweek-being-
+    decided rule (2026-09-02) -- is reconstruction of something FPL publishes
+    outright at ``/entry/{id}/history/``. Getting it wrong is expensive and
+    silent: a chip wrongly believed spent stays spent for the rest of the half.
+
+    Checked against entry 504618 on 2026-09-09, the inference happened to
+    AGREE with FPL (13 chip rows collapsing to the real ``3xc`` at GW2 and
+    ``freehit`` at GW3), so this is not a fix for a live wrong answer. It
+    removes the class: the case the heuristics cannot reach is a recommendation
+    the operator declined, which leaves a row saying "played" and no
+    counter-evidence anywhere in the log.
+
+    ``entry_id`` is None for the paths that have no real entry to ask about --
+    the backtest walk and the shadow personas -- and those keep the inference.
+    """
+    if entry_id:
+        played = _chips_from_fpl(season, entry_id)
+        if played is not None:
+            return played
+        logger.warning(
+            "No FPL chip record for entry %d in %s, so chip availability is "
+            "inferred from the bot's own recommendation log. Run the ingest "
+            "(data.ingestors.fpl_api.ingest_entry_chips) to read the real "
+            "one -- a recommendation the operator declined is indistinguishable "
+            "from a chip played, and will be treated as spent.",
+            entry_id, season,
+        )
+    return chips_used_this_season(decision_log)
+
+
+def _chips_from_fpl(season: str, entry_id: int) -> list[tuple[Chip, int]] | None:
+    """The ground-truth rows, or None if we have never successfully asked.
+
+    An empty LIST and None are different answers -- "nothing played yet" and
+    "we do not know" -- which is why the sync marker is consulted rather than
+    the row count. Conflating them is exactly how a declined recommendation
+    would get read back as a played chip.
+    """
+    db = get_session()
+    try:
+        synced = db.execute(
+            text(
+                "SELECT 1 FROM chip_usage_sync WHERE season = :s AND entry_id = :e"
+            ),
+            {"s": season, "e": entry_id},
+        ).first()
+        if synced is None:
+            return None
+        rows = db.execute(
+            text(
+                "SELECT chip, gameweek FROM chip_usage "
+                "WHERE season = :s AND entry_id = :e ORDER BY gameweek, chip"
+            ),
+            {"s": season, "e": entry_id},
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 -- an unreadable table must not
+        # take down a decision run; the caller falls back to the log and says so.
+        logger.warning("Could not read chip ground truth: %s", exc)
+        return None
+    finally:
+        db.close()
+
+    played: list[tuple[Chip, int]] = []
+    for name, gameweek in rows:
+        try:
+            played.append((Chip(name), int(gameweek)))
+        except ValueError:
+            # FPL shipping a chip this bot does not model (a new one, or a
+            # renamed one) must be loud: it is a chip genuinely spent that the
+            # optimiser would otherwise believe it still has.
+            logger.error(
+                "FPL reports chip %r played at GW%s for entry %d, which this "
+                "bot does not model. It is spent and will not be accounted for.",
+                name, gameweek, entry_id,
+            )
+    return played
+
+
 def _chip_uses_remaining(
     chip: Chip, used: list[tuple[Chip, int]], current_gw: int, season: str | None = None
 ) -> int:

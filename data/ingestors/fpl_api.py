@@ -5,9 +5,12 @@ from datetime import datetime
 import aiohttp
 from sqlalchemy.dialects.sqlite import insert
 
+from config.settings import settings
 from data.db import get_session
 from data.ingestors.setpiece import ingest_fpl_setpiece_roles
 from data.models import (
+    ChipUsage,
+    ChipUsageSync,
     Fixture,
     Gameweek,
     Player,
@@ -638,6 +641,99 @@ async def ingest_player_history(
         db.close()
 
 
+
+async def fetch_entry_history(entry_id: int) -> dict:
+    """``/entry/{id}/history/`` -- includes a ``chips`` array of
+    ``{name, event, time}`` for every chip the entry has ACTUALLY played.
+    Public and unauthenticated; no login is needed to read your own entry."""
+    async with aiohttp.ClientSession() as session:
+        return await _get(session, f"/entry/{entry_id}/history/")
+
+
+def upsert_entry_chips(history: dict, season: str, entry_id: int) -> int:
+    """Write FPL's chip list for one entry, plus the sync marker.
+
+    The marker is written even when the list is EMPTY, and that is the point:
+    "we asked and nothing has been played" has to be distinguishable from "we
+    never asked", or a chip the operator declined gets read back off the
+    recommendation log as though it had been played. See
+    ``data.models.ChipUsageSync``.
+
+    Chips are never un-played, so this only inserts -- it does not delete rows
+    absent from the payload. A chip vanishing from FPL's own history would be
+    FPL contradicting itself, and silently dropping our record of it is not
+    the response to that.
+    """
+    chips = history.get("chips") or []
+    now = datetime.utcnow()
+    db = get_session()
+    try:
+        for chip in chips:
+            name = chip.get("name")
+            event = chip.get("event")
+            if not name or event is None:
+                logger.warning("Skipping malformed chip entry from FPL: %r", chip)
+                continue
+            played_at = None
+            if chip.get("time"):
+                try:
+                    played_at = datetime.fromisoformat(
+                        chip["time"].replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except ValueError:
+                    logger.warning("Unparseable chip timestamp %r", chip.get("time"))
+            db.execute(
+                insert(ChipUsage)
+                .values(
+                    season=season, entry_id=entry_id, chip=name,
+                    gameweek=int(event), played_at=played_at, synced_at=now,
+                )
+                .on_conflict_do_update(
+                    index_elements=["season", "entry_id", "chip", "gameweek"],
+                    set_={"played_at": played_at, "synced_at": now},
+                )
+            )
+        db.execute(
+            insert(ChipUsageSync)
+            .values(
+                season=season, entry_id=entry_id,
+                chips_seen=len(chips), synced_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=["season", "entry_id"],
+                set_={"chips_seen": len(chips), "synced_at": now},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+    logger.info(
+        "Chip ground truth for entry %d, %s: %d played", entry_id, season, len(chips)
+    )
+    return len(chips)
+
+
+async def ingest_entry_chips(season: str, entry_id: int) -> int | None:
+    """Best-effort. A missing FPL_TEAM_ID, a 404 from a wrong one or a network
+    blip must not take down an ingest run: the consumers fall back to the
+    recommendation log, which is what they used exclusively until 2026-09-09.
+    Returns the number of chips recorded, or None if we could not ask."""
+    if not entry_id:
+        logger.warning(
+            "FPL_TEAM_ID is unset, so chip usage cannot be read from FPL. "
+            "Chip availability will be inferred from the bot's own "
+            "recommendation log, which records what it ADVISED, not what was "
+            "played."
+        )
+        return None
+    try:
+        history = await fetch_entry_history(entry_id)
+    except (TimeoutError, aiohttp.ClientError) as exc:
+        logger.warning("Could not read chip usage for entry %d: %s", entry_id, exc)
+        return None
+    return upsert_entry_chips(history, season, entry_id)
+
+
 async def run_full_ingest(season: str = "2026-27") -> None:
     logger.info("Starting full FPL ingest for season %s", season)
 
@@ -654,6 +750,10 @@ async def run_full_ingest(season: str = "2026-27") -> None:
 
     raw_fixtures = await fetch_fixtures()
     upsert_fixtures(raw_fixtures, season)
+
+    # Ground truth for which chips have actually been played, as opposed to
+    # which ones the bot recommended (2026-09-09). Best-effort by design.
+    await ingest_entry_chips(season, settings.fpl_team_id)
 
     db = get_session()
     try:

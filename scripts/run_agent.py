@@ -16,6 +16,7 @@ logging.basicConfig(
 
 from agent import decision_engine, notifier, team_sheet
 from config.strategy import OPTIMISER
+from data.db import init_db
 from data.ingestors.fpl_api import run_full_ingest
 from data.ingestors.injury_parser import run_injury_parser
 from data.ingestors.odds_api import ingest_odds_sync, log_odds_coverage
@@ -57,6 +58,15 @@ def main() -> None:
     # timer (deploy/fpl-bot.timer) only schedules THIS script, so nothing
     # anywhere ever kept that base data fresh. run_full_ingest first so a
     # single run always decides against current data.
+    # 2026-09-09: this script is the deployed timer's only entry point
+    # (deploy/fpl-bot.timer) and was the one runner in the repo that never
+    # called init_db -- every scraper does. A table added since the live
+    # database was built therefore never got created on it, and the code
+    # reading it degraded quietly instead of failing, which is how a feature
+    # ships and then does nothing. create_all builds missing tables and never
+    # alters existing ones, so this is safe to run every week.
+    init_db()
+
     try:
         asyncio.run(run_full_ingest(args.season))
     except Exception as exc:
