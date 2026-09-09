@@ -1,54 +1,50 @@
 {
   "bench_order": [
-    "Dubravka",
-    "Van Hecke",
-    "Obi",
-    "Neave"
+    "Kelleher",
+    "Ajayi",
+    "Kayode",
+    "Foden"
   ],
-  "captain": "B.Fernandes",
-  "chips_left_this_half": 3,
-  "cost": 99.9,
+  "captain": "Gomez",
+  "chips_left_this_half": 2,
+  "cost": 97.5,
   "degenerate": [
     "injury_severity",
-    "is_bgw",
-    "is_penalty_taker",
-    "is_set_piece_taker",
-    "key_passes_per_game",
-    "penalty_xg_per_game"
+    "is_bgw"
   ],
-  "gws_left_this_half": 19,
+  "gws_left_this_half": 16,
   "n_features": 42,
   "squad": [
-    "Anderson",
-    "B.Fernandes",
-    "Dubravka",
-    "Gabriel",
+    "Ajayi",
+    "Barry",
+    "Calafiori",
+    "De Cuyper",
+    "Foden",
+    "Gakpo",
+    "Gomez",
     "Gu\u00e9hi",
-    "Neave",
-    "Obi",
+    "Haaland",
+    "Kayode",
+    "Kelleher",
+    "Mbeumo",
     "Raya",
-    "Rice",
-    "Semenyo",
     "Szoboszlai",
-    "Tarkowski",
-    "Thiago",
-    "Van Hecke",
-    "Virgil"
+    "Wissa"
   ],
   "starting_xi": [
-    "Anderson",
-    "B.Fernandes",
-    "Gabriel",
+    "Barry",
+    "Calafiori",
+    "De Cuyper",
+    "Gakpo",
+    "Gomez",
     "Gu\u00e9hi",
+    "Haaland",
+    "Mbeumo",
     "Raya",
-    "Rice",
-    "Semenyo",
     "Szoboszlai",
-    "Tarkowski",
-    "Thiago",
-    "Virgil"
+    "Wissa"
   ],
   "teams_on_prior_strength": 17,
   "teams_with_live_strength": 0,
-  "vice_captain": "Gabriel"
+  "vice_captain": "Haaland"
 }
