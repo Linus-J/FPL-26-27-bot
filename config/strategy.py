@@ -521,11 +521,20 @@ class OptimiserConfig:
     #     2026-08-20), which short-circuits to the mean-optimal squad without
     #     generating a pool at all.
     #
-    # As of 2026-08-25 mu is -0.25, so the variance term and the joint squad
-    # selection are LIVE. Lambda is still zero for the real bot (it scales off
-    # risk_level, which remains 0), so the ownership weighting stays dormant
-    # and covariance-aware captaincy still short-circuits -- those two are
-    # exercised only by the persona cohort.
+    # STATUS, corrected 2026-09-09: mu is back at 0.0 and all four of those
+    # capabilities are dormant again. This comment claimed "as of 2026-08-25 mu
+    # is -0.25, so the variance term and the joint squad selection are LIVE"
+    # and went on saying it after the value was reverted, which made the file
+    # describe a configuration the bot was not running. mu=-0.25 did go live,
+    # for one gameweek: at GW2 it captained the goalkeeper and paid a -4 hit
+    # for -11.45 xPts, and was reverted to 0.0. (A separate units bug found at
+    # the same time was fixed on its own merits and is not the reason for the
+    # revert.) Lambda is zero either way -- it scales off risk_level, which
+    # remains 0 -- so the ownership weighting and covariance-aware captaincy
+    # are exercised only by the persona cohort, as they always were.
+    #
+    # The reasoning below is kept as the record of the 2026-08-21 decision and
+    # the evidence behind it. It is history, not a description of the present.
     #
     # The joint objective was calibrated on 2026-08-20 and mu was HELD at 0.0
     # through GW1, then set to -0.25 on 2026-08-25 (see the decision at the
@@ -566,12 +575,17 @@ class OptimiserConfig:
     # sweeps risk_level around this baseline, so the season measures it.
     mu_baseline: float = 0.0
     # How many distinct squads the joint re-ranker considers
-    # (optimiser/joint_risk.py). Measured at 0.24s per MILP solve on the live
-    # GW1 frame, so 200 costs ~48s per gameweek -- affordable for a calibration
-    # sweep, since the pool is built once at mu=0 and reused for every
-    # candidate mu. This is LIVE cost as of 2026-08-25 (mu=-0.25): the
-    # short-circuit in optimise_squad_joint no longer fires, so every real
-    # decision pays for the pool. It stays inert only if mu returns to 0.
+    # (optimiser/joint_risk.py). The 0.24s-per-MILP-solve figure this comment
+    # used to quote was measured on the GW1 frame and no longer reproduces on a
+    # full one; treat "200 costs ~48s" as stale until someone re-measures it.
+    #
+    # Corrected 2026-09-09: this said the pool is a LIVE cost "as of 2026-08-25
+    # (mu=-0.25)". mu is back at 0.0 (see mu_baseline above), and
+    # optimise_squad_joint short-circuits at mu == 0.0 before opening a session
+    # (optimiser/joint_risk.py:314), so the real bot builds no pool and pays
+    # nothing for this. It is a cost for the persona cohort, which sweeps
+    # risk_level off zero, and for calibration sweeps -- where the pool is
+    # built once at mu=0 and reused for every candidate mu.
     joint_rerank_pool_size: int = 200
     # Widened 2026-08-18, together with the switch from variance to upside
     # semi-deviation as the risk term (optimiser/scoring.risk_adjusted_score).

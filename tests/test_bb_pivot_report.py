@@ -93,6 +93,7 @@ def test_the_bb_ready_squad_is_built_with_a_boosted_bench(monkeypatch):
             config=OPTIMISER,
             season=None,
             chip_timing=CHIP_TIMING,
+            chips_used=[],
         )
 
     assert seen["bb_target_week"] == 2
@@ -101,3 +102,74 @@ def test_the_bb_ready_squad_is_built_with_a_boosted_bench(monkeypatch):
     # the horizon's weeks. Passing target_gw there while leaving horizon at 1
     # is what measured the bench at one week on a squad built for another.
     assert "gameweek" not in seen
+
+
+def test_a_spent_bench_boost_is_not_planned_for(monkeypatch):
+    """``optimiser/chips.py::_try_bb`` gates on uses remaining as its very
+    first line; this report did not (until 2026-09-09). Once the chip was
+    spent for the half it still nominated a target week, solved a second
+    squad and quoted the transfer cost of moving to it -- a plan for a chip
+    that cannot be played until the half turns over.
+
+    The solver is stubbed to explode, so reaching it at all fails the test:
+    the gate has to come before the expensive work, not merely change the
+    text afterwards."""
+    import agent.decision_engine as de
+    from optimiser.chips import Chip
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("solved a BB-ready squad for a chip already played")
+
+    monkeypatch.setattr(de, "optimise_squad_joint", _explode)
+    monkeypatch.setattr(de, "select_bb_target_gw", _explode)
+
+    out = de._bench_boost_readiness(
+        unconstrained_squad=types.SimpleNamespace(
+            squad=pd.DataFrame({"id": _SQUAD_IDS})
+        ),
+        projections=_frame({4: 8.0, 5: 9.0, 6: 30.0}),
+        players=pd.DataFrame(),
+        next_gw=4,
+        available_budget=100.0,
+        ownership=None,
+        config=OPTIMISER,
+        season=None,
+        chip_timing=CHIP_TIMING,
+        chips_used=[(Chip.BENCH_BOOST, 2)],
+    )
+
+    assert out["target_gameweek"] is None
+    assert "no use left in this half" in out["reason"]
+
+
+def test_another_chip_being_spent_does_not_block_the_report(monkeypatch):
+    """The gate is per chip. A free hit already played must not stop the bench
+    boost being planned for."""
+    import agent.decision_engine as de
+    from optimiser.chips import Chip
+
+    seen = {}
+
+    def _spy(projections, players, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("stop after capturing the call")
+
+    monkeypatch.setattr(de, "optimise_squad_joint", _spy)
+
+    with pytest.raises(RuntimeError, match="stop after capturing the call"):
+        de._bench_boost_readiness(
+            unconstrained_squad=types.SimpleNamespace(
+                squad=pd.DataFrame({"id": _SQUAD_IDS})
+            ),
+            projections=_frame({4: 8.0, 5: 9.0, 6: 30.0}),
+            players=pd.DataFrame(),
+            next_gw=4,
+            available_budget=100.0,
+            ownership=None,
+            config=OPTIMISER,
+            season=None,
+            chip_timing=CHIP_TIMING,
+            chips_used=[(Chip.FREE_HIT, 3)],
+        )
+
+    assert seen["bb_target_week"] == 2

@@ -446,6 +446,7 @@ def _bench_boost_readiness(
     config: OptimiserConfig,
     season: str | None,
     chip_timing: ChipTimingThresholds,
+    chips_used: list[tuple[Chip, int]],
 ) -> dict:
     """The unconstrained squad's answer plus, when a target week exists, a
     BB-ready alternative and the price of moving between them.
@@ -455,6 +456,21 @@ def _bench_boost_readiness(
     ``optimiser/bench_boost.py``'s module docstring for why automatic
     selection between the two is deliberately absent.
     """
+    # 2026-09-09: the chip has to still be PLAYABLE. `optimiser/chips.py::
+    # _try_bb` gates on uses remaining as its very first line; this report did
+    # not, so once the Bench Boost was spent for the half it still nominated a
+    # target week, solved a second squad, and quoted the transfer cost of
+    # moving to it -- a plan for a chip that cannot be played until the half
+    # turns over. Same source of truth as the decision, or the two disagree.
+    if Chip.BENCH_BOOST not in chips_available_this_half(chips_used, next_gw, season):
+        return {
+            "target_gameweek": None,
+            "reason": (
+                "the bench boost has no use left in this half of the season, "
+                "so there is no week to build towards"
+            ),
+        }
+
     unconstrained_ids = unconstrained_squad.squad["id"].tolist()
     target = select_bb_target_gw(
         unconstrained_ids, projections, next_gw, chip_timing.bench_boost_min_bench_xpts,
@@ -951,6 +967,7 @@ def _run_decision_cycle(
             config=config,
             season=season,
             chip_timing=chip_timing,
+            chips_used=chips_used,
         )
     except Exception as exc:  # noqa: BLE001 -- shadow work never breaks a run
         logger.warning("bench-boost readiness skipped: %s", exc)
