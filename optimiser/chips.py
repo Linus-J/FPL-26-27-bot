@@ -10,6 +10,7 @@ from sqlalchemy import text
 from config.strategy import CHIP_TIMING, CHIPS, ChipTimingThresholds, OptimiserConfig
 from data.db import get_session
 from optimiser.bench_boost import (
+    bench_boost_bar,
     bench_xpts_by_gameweek,
     select_bb_target_gw,
     should_hold_bench_boost,
@@ -557,10 +558,14 @@ def recommend_chip(
         # is worth some points every single gameweek, and there are two full
         # sets of chips with no carryover.
         #
-        # A DGW is now expressed where it belongs -- in the NUMBER. A doubled
-        # bench scores roughly twice as much, so it clears
-        # bench_boost_min_bench_xpts easily, while an ordinary bench clears it
-        # only if it is genuinely strong. That is a preference, not a gate.
+        # A DGW is now expressed where it belongs -- in the NUMBER. That
+        # number became a RATIO on 2026-09-09 (`bench_boost_bar`), because the
+        # absolute one it replaced was not expressing a preference at all: at
+        # 20.0 xPts no squad the optimiser could build ever cleared it, so a
+        # double gameweek was still, in practice, a gate. Against this squad's
+        # own median bench a doubled bench is roughly 2x and clears outright,
+        # while an ordinary week clears only if it is genuinely better than
+        # this squad's typical week.
         if bench_xpts is None:
             return None
         bb_scenarios = pd.Series(dtype=float)
@@ -568,7 +573,15 @@ def recommend_chip(
             bench_ids = _bench_player_ids(current_squad_ids, projections, current_gw)
             if bench_ids:
                 bb_scenarios = load_scenario_totals(season, current_gw, bench_ids)
-        threshold = timing.bench_boost_min_bench_xpts * _panic_shrink(current_gw, season, timing)
+        bar = bench_boost_bar(
+            current_squad_ids,
+            projections,
+            current_gw,
+            ratio=timing.bench_boost_min_bench_ratio,
+            floor=timing.bench_boost_min_bench_floor,
+            shrink=_panic_shrink(current_gw, season, timing),
+        )
+        threshold = bar.threshold
         if not force and not _clears_threshold(
             bench_xpts, threshold, bb_scenarios, timing.bench_boost_min_payoff_probability
         ):

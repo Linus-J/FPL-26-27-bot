@@ -292,7 +292,39 @@ class ChipTimingThresholds:
     free_hit_comparison_margin: float = 12.0
     wildcard_comparison_margin: float = 25.0
 
-    bench_boost_min_bench_xpts: float = 20.0
+    # The bench a gameweek must produce before the chip is worth spending,
+    # expressed as a RATIO of this squad's own median bench across the visible
+    # window (2026-09-09). Replaced `bench_boost_min_bench_xpts = 20.0`, which
+    # no squad the optimiser can build was able to reach: measured on post-A10
+    # projections at GW3, the carried squad benched 11.97-13.61 over GW4-8, and
+    # a squad solved with `bb_target_week` to MAXIMISE the bench in a chosen
+    # week topped out at 15.56. The gate never opened, so `_panic_shrink` alone
+    # timed the chip -- the Bench Boost fired at GW18 and GW37 every season
+    # whatever the fixtures did, with every piece of timing machinery behind
+    # that gate (`select_bb_target_gw`, `should_hold_bench_boost`,
+    # `bench_boost_hold_margin_xpts`, the BB-ready squad build) inert.
+    #
+    # A ratio rather than a smaller absolute number because an absolute one is
+    # denominated in the model's output scale, and that scale moved twice in
+    # the month before this was written (A9's training arm, A10's serve-time
+    # as-of row). A bar in xPts silently drifts out of range when it does and
+    # nothing logs it; that is exactly how 20.0 got here.
+    #
+    # 1.25 is not backtested -- the shape is what matters. On the GW4-8 window
+    # the median bench was 13.10, putting the bar at 16.4, and none of those
+    # five ordinary weeks clears it (correct: none of them is a special bench
+    # week), while a double gameweek roughly doubles the bench and clears it
+    # outright. See `optimiser/bench_boost.py::bench_boost_bar`.
+    bench_boost_min_bench_ratio: float = 1.25
+
+    # A catastrophe guard, not a second calibrated number. The one case a pure
+    # ratio gets wrong is a window so poor that 1.25x its median is still
+    # worthless -- a blank gameweek with most of the bench lacking a fixture.
+    # Deliberately far below the operating range (11-16 xPts) so it cannot go
+    # stale the way 20.0 did, and deliberately NOT discounted by
+    # `_panic_shrink`: the salvage force in `recommend_chip` is what rescues a
+    # chip about to expire, and it bypasses both bars outright.
+    bench_boost_min_bench_floor: float = 8.0
 
     # How much better a LATER bench-boost week must be before the chip is held
     # back rather than played now (2026-09-06).

@@ -11,6 +11,8 @@ staying byte-identical to pre-P3-5 behaviour whenever no samples exist.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pandas as pd
 import pytest
 from sqlalchemy import create_engine
@@ -688,6 +690,23 @@ def test_chips_used_this_season_empty_log_returns_empty_list():
 _BB_SQUAD = list(range(1, 16))
 
 
+def _hold_only_timing():
+    """Chip timing with the bench-boost bar switched off.
+
+    The two tests below are about ``should_hold_bench_boost`` -- whether a
+    better week later in the window defers the chip -- and the bar in front of
+    it is noise for that question. Since 2026-09-09 that bar is a RATIO of the
+    window's own median bench (`optimiser/bench_boost.py::bench_boost_bar`),
+    so it cannot be cleared by a week that is merely typical for the window,
+    and every hand-built frame here is deliberately flat. Left standing, it
+    would return None before the hold ever ran and both tests would pass
+    without exercising their subject.
+    """
+    return dataclasses.replace(
+        chips.CHIP_TIMING, bench_boost_min_bench_ratio=0.0, bench_boost_min_bench_floor=0.0
+    )
+
+
 def _bb_frame(rows_by_gw: dict[int, list[float]]) -> pd.DataFrame:
     """One row per (player, gameweek) from an explicit per-week xPts list.
 
@@ -721,7 +740,7 @@ def test_the_hold_compares_both_weeks_by_the_same_bench_definition():
     rec = chips.recommend_chip(
         current_gw=10, current_squad_ids=_BB_SQUAD, projections=projections,
         players=pd.DataFrame(), available_budget=100.0, free_transfers=1,
-        season=None, bench_xpts=21.0,
+        season=None, bench_xpts=21.0, chip_timing=_hold_only_timing(),
         chips_used=[
             (chips.Chip.TRIPLE_CAPTAIN, 9),
             (chips.Chip.FREE_HIT, 9),
@@ -750,7 +769,7 @@ def test_a_holdable_bench_boost_is_still_forced_through_by_the_salvage_path():
     held = chips.recommend_chip(
         current_gw=16, current_squad_ids=_BB_SQUAD, projections=projections,
         players=pd.DataFrame(), available_budget=100.0, free_transfers=1,
-        season=None, bench_xpts=25.0,
+        season=None, bench_xpts=25.0, chip_timing=_hold_only_timing(),
         chips_used=[(c, 15) for c in used_at], squad_age_gws=0,
     )
     assert held.chip is None
@@ -759,7 +778,7 @@ def test_a_holdable_bench_boost_is_still_forced_through_by_the_salvage_path():
     forced = chips.recommend_chip(
         current_gw=19, current_squad_ids=_BB_SQUAD, projections=projections,
         players=pd.DataFrame(), available_budget=100.0, free_transfers=1,
-        season=None, bench_xpts=25.0,
+        season=None, bench_xpts=25.0, chip_timing=_hold_only_timing(),
         chips_used=[(c, 18) for c in used_at], squad_age_gws=0,
     )
     assert forced.chip == chips.Chip.BENCH_BOOST

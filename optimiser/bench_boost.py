@@ -21,6 +21,8 @@ and must never be read by a squad or chip decision.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from statistics import median
 
 import pandas as pd
 
@@ -77,6 +79,82 @@ def bench_xpts_by_gameweek(
         bench = group.nsmallest(4, "xpts")
         totals[int(gw)] = float(bench["xpts"].sum())
     return totals
+
+
+@dataclass(frozen=True)
+class BenchBoostBar:
+    """The bench xPts a gameweek must reach before the chip is worth spending.
+
+    `threshold` is what gets compared; the rest is what the reports need to
+    say which bar was applied and why. `ratio` is the ratio AFTER any panic
+    shrink, so it is the one that ran, not the configured one.
+    """
+
+    threshold: float
+    median_bench: float | None
+    ratio: float
+    floor: float
+
+    def describe(self) -> str:
+        """One phrase naming the bar that was applied, for the readiness
+        reports -- which quote the bar back at a human deciding whether to
+        build towards a boost week, and are useless if they quote a number
+        without saying where it came from."""
+        if self.median_bench is None:
+            return f"{self.floor:.2f} xPts (its floor; no projected bench in the window)"
+        ratio_bar = self.ratio * self.median_bench
+        if self.threshold > ratio_bar:
+            return (
+                f"{self.threshold:.2f} xPts (its floor; {self.ratio:.2f}x the "
+                f"window's median bench of {self.median_bench:.2f} would be "
+                f"only {ratio_bar:.2f})"
+            )
+        return (
+            f"{self.threshold:.2f} xPts ({self.ratio:.2f}x the window's median "
+            f"bench of {self.median_bench:.2f})"
+        )
+
+
+def bench_boost_bar(
+    squad_ids: list[int],
+    projections: pd.DataFrame,
+    current_gw: int,
+    *,
+    ratio: float,
+    floor: float,
+    shrink: float = 1.0,
+) -> BenchBoostBar:
+    """The bench-boost bar for THIS squad over the window it can see.
+
+    Replaced the absolute `bench_boost_min_bench_xpts = 20.0` on 2026-09-09;
+    `config/strategy.py::bench_boost_min_bench_ratio` carries the measurement
+    that condemned it and the reason the replacement is a ratio.
+
+    The question the chip poses is "is this week unusually good for MY bench",
+    which is scale-free, so the bar is `ratio` x the median bench across the
+    window rather than a number in xPts that has to be re-derived every time
+    the projection scale moves.
+
+    `shrink` (`optimiser/chips.py::_panic_shrink`) applies to the ratio's
+    EXCESS over 1.0, not to the bar: shrinking 1.25 to 0.375x the median would
+    be meaningless, whereas `1 + shrink * (ratio - 1)` decays to 1.075x at
+    full shrink -- "take a slightly-above-typical week" -- which is the right
+    posture as a half runs out. The floor is not shrunk at all; a chip about
+    to expire is rescued by the salvage force in `recommend_chip`, which
+    bypasses this bar entirely, so discounting the catastrophe guard as well
+    would only buy the right to spend the chip on a blank gameweek.
+
+    An empty window leaves the floor: there is no median to be unusual
+    against, and a bar of 0.0 would fire the chip on nothing at all.
+    """
+    totals = bench_xpts_by_gameweek(squad_ids, projections, current_gw)
+    shrunk_ratio = 1.0 + shrink * (ratio - 1.0)
+    if not totals:
+        return BenchBoostBar(floor, None, shrunk_ratio, floor)
+    median_bench = float(median(totals.values()))
+    return BenchBoostBar(
+        max(floor, shrunk_ratio * median_bench), median_bench, shrunk_ratio, floor
+    )
 
 
 def select_bb_target_gw(

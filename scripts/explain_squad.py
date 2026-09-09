@@ -56,6 +56,7 @@ from data.db import get_session  # noqa: E402
 from data.ingestors.odds_api import odds_coverage_by_gameweek  # noqa: E402
 from optimiser.bench_boost import (  # noqa: E402
     bb_horizon_and_index,
+    bench_boost_bar,
     bench_xpts_by_gameweek,
     pivot_price,
     select_bb_target_gw,
@@ -269,10 +270,16 @@ def _bb_readiness_section(
     says. See `optimiser/bench_boost.py`'s module docstring for why automatic
     selection between the two is deliberately absent.
     """
-    threshold = CHIP_TIMING.bench_boost_min_bench_xpts
     unconstrained_ids = solution.squad["id"].tolist()
     totals = bench_xpts_by_gameweek(unconstrained_ids, projections, current_gw)
-    target = select_bb_target_gw(unconstrained_ids, projections, current_gw, threshold)
+    bar = bench_boost_bar(
+        unconstrained_ids,
+        projections,
+        current_gw,
+        ratio=CHIP_TIMING.bench_boost_min_bench_ratio,
+        floor=CHIP_TIMING.bench_boost_min_bench_floor,
+    )
+    target = select_bb_target_gw(unconstrained_ids, projections, current_gw, bar.threshold)
 
     if target is None:
         # The bar named here is the STANDING one. The chip decision
@@ -282,7 +289,7 @@ def _bb_readiness_section(
         # shrinking it here, which would change which squad gets built.
         lines = [
             f"**No gameweek in the projection window clears the standing bench-boost "
-            f"threshold of {threshold:.1f} xPts** -- no BB-ready squad was built. "
+            f"bar of {bar.describe()}** -- no BB-ready squad was built. "
             f"(The chip decision discounts this bar near a half's expiry, so it may "
             f"still be holding for a week below it.)"
         ]

@@ -22,6 +22,7 @@ from data.models import ChipComparisonLog, DecisionLog, SimDecisionLog, SimManag
 from data.overrides import apply_team_overrides, load_p_leave_overrides, log_rumoured_squad_members
 from optimiser.bench_boost import (
     bb_horizon_and_index,
+    bench_boost_bar,
     bench_xpts_by_gameweek,
     pivot_price,
     select_bb_target_gw,
@@ -472,26 +473,31 @@ def _bench_boost_readiness(
         }
 
     unconstrained_ids = unconstrained_squad.squad["id"].tolist()
-    target = select_bb_target_gw(
-        unconstrained_ids, projections, next_gw, chip_timing.bench_boost_min_bench_xpts,
+    # The STANDING bar, i.e. no `shrink` argument. The chip DECISION
+    # (`optimiser/chips.py::_try_bb`) discounts the same bar by `_panic_shrink`
+    # as a half's expiry approaches, so late in a half it can be holding for a
+    # target this report calls non-existent. Reporting the standing bar and
+    # saying so is honest; shrinking it here too would change which squad gets
+    # built, which is a decision this report deliberately does not make.
+    bar = bench_boost_bar(
+        unconstrained_ids,
+        projections,
+        next_gw,
+        ratio=chip_timing.bench_boost_min_bench_ratio,
+        floor=chip_timing.bench_boost_min_bench_floor,
     )
+    target = select_bb_target_gw(unconstrained_ids, projections, next_gw, bar.threshold)
     if target is None:
         return {
             "target_gameweek": None,
-            # 2026-09-07 (B8): name the bar that was actually applied. The
-            # chip DECISION (`optimiser/chips.py::_try_bb`) shrinks this same
-            # number by `_panic_shrink` as a half's expiry approaches, so late
-            # in a half it can be holding for a target this report calls
-            # non-existent. Reporting the standing bar and saying so is
-            # honest; shrinking it here too would change which squad gets
-            # built, which is a decision this report deliberately does not
-            # make.
+            # 2026-09-07 (B8): name the bar that was actually applied -- since
+            # 2026-09-09 that means naming the median it was derived from too,
+            # because a ratio bar is not a constant a reader can look up.
             "reason": (
                 "no gameweek in the projection window clears the standing "
-                "bench-boost threshold of "
-                f"{chip_timing.bench_boost_min_bench_xpts:.1f} xPts (the chip "
-                "decision discounts this bar near a half's expiry, so it may "
-                "still be holding for a week below it)"
+                f"bench-boost bar of {bar.describe()} (the chip decision "
+                "discounts this bar near a half's expiry, so it may still be "
+                "holding for a week below it)"
             ),
         }
     target_gw, unconstrained_bench_xpts = target
@@ -1149,8 +1155,18 @@ def run_for_persona(persona: SimManager, season: str = "2026-27") -> dict:
         free_hit_single_gw_gain_threshold=(
             CHIP_TIMING.free_hit_single_gw_gain_threshold * persona.chip_aggressiveness
         ),
-        bench_boost_min_bench_xpts=(
-            CHIP_TIMING.bench_boost_min_bench_xpts * persona.chip_aggressiveness
+        # The ratio's EXCESS over 1.0 is what scales, not the ratio itself.
+        # `chip_aggressiveness` is a multiplier on how far above ordinary a
+        # week has to be; applied to 1.25 directly it would demand 1.5x the
+        # median at aggressiveness 1.2, a far bigger move than the same factor
+        # makes to any of the absolute thresholds beside it. The floor scales
+        # directly, being an absolute number like those.
+        bench_boost_min_bench_ratio=(
+            1.0
+            + (CHIP_TIMING.bench_boost_min_bench_ratio - 1.0) * persona.chip_aggressiveness
+        ),
+        bench_boost_min_bench_floor=(
+            CHIP_TIMING.bench_boost_min_bench_floor * persona.chip_aggressiveness
         ),
         triple_captain_min_gain=(
             CHIP_TIMING.triple_captain_min_gain * persona.chip_aggressiveness
