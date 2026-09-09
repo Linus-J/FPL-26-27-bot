@@ -3,8 +3,10 @@ from dataclasses import dataclass
 
 import pandas as pd
 import pulp
+from sqlalchemy import text
 
 from config.strategy import OPTIMISER, SQUAD, TRANSFERS, OptimiserConfig, TransferRules
+from data.db import get_session
 from data.overrides import load_excluded_player_ids
 from optimiser.bench_weights import bench_gk_weight_for_week, bench_slot_weight_for_week
 from optimiser.departure_risk import confirmed_p_leave, is_hard_excluded
@@ -49,24 +51,147 @@ def roll_forward_free_transfers(
     surplus is paid in points, not in next week's allowance, so the result
     still floors at the weekly allowance.
 
-    **Wildcard and Free Hit behave identically here** (fixed 2026-08-18,
-    engine review §10). Both chips' transfers are outside the allowance
-    entirely, and FPL RETAINS your saved free transfers across either one —
-    confirmed against the Premier League's own worked example: two saved
-    before a Gameweek 6 wildcard leaves THREE for Gameweek 7 (the two saved,
-    plus GW7's allotment). You simply do not earn an extra one in the week you
-    play the chip, which is what ``transfers_made = 0`` expresses.
+    **Wildcard and Free Hit behave identically here** (2026-08-18, engine
+    review §10): both chips' transfers are outside the allowance entirely, and
+    FPL retains your saved free transfers across either one.
 
-    This previously returned the bare weekly allowance after a wildcard,
-    destroying up to four banked transfers — roughly 16 points of avoidable
-    hits, twice a season — while the Free Hit branch directly below already
-    had it right. ``ft[0]`` in the multi-period ILP is seeded from this value,
-    so every subsequent week planned against a wrong allowance too."""
+    **A chip week leaves the allowance UNCHANGED** (fixed 2026-09-09). Saved
+    transfers survive, but the chip consumes that gameweek's own allotment, so
+    nothing is added on top. This function used to zero ``transfers_made`` and
+    then add the weekly ``+1`` anyway, inventing a transfer every time a chip
+    was played -- contradicting its own comment, which already said "you do
+    not earn an extra one in the week you play the chip".
+
+    Caught on live data. Entry 504618 went into GW2 with 1 free transfer, made
+    two transfers for a -4 hit (so the allowance was demonstrably 1), rolled
+    forward to 1 for GW3, played the Free Hit there -- and FPL showed **1**
+    free transfer for GW4 where this returned 2. The Premier League's own
+    worked example agrees once read correctly: two saved after the Gameweek 5
+    deadline means THREE available in Gameweek 6 (the two, plus GW6's
+    allotment), the wildcard consumes GW6's, and Gameweek 7 has three again --
+    the same number, not four. The comment here previously read that example
+    as 2 -> 3 and enshrined the extra transfer.
+
+    Before 2026-08-18 this returned the bare weekly allowance after a
+    wildcard, destroying up to four banked transfers. ``ft[0]`` in the
+    multi-period ILP is seeded from this value, so every subsequent week
+    planned against a wrong allowance too."""
     trules = transfer_rules or TRANSFERS
     if wildcard_played or free_hit_played:
-        transfers_made = 0
+        return min(
+            trules.max_banked_free_transfers,
+            max(trules.free_transfers_per_gw, free_transfers),
+        )
     carried = free_transfers - transfers_made + trules.free_transfers_per_gw
     return min(trules.max_banked_free_transfers, max(trules.free_transfers_per_gw, carried))
+
+
+def free_transfers_this_gameweek(
+    season: str,
+    entry_id: int | None,
+    next_gw: int,
+    transfer_rules: TransferRules | None = None,
+) -> int | None:
+    """The free-transfer allowance for ``next_gw``, reconstructed from what
+    FPL says the entry actually did (2026-09-09).
+
+    Returns ``None`` when it cannot be answered -- no entry id (the backtest
+    walk and the shadow personas, which have no FPL entry), nothing synced
+    yet, or a gameweek early enough that the question is meaningless. The
+    caller then falls back to the value carried in ``decision_log``.
+
+    Nothing publishes this number: FPL states it only on the authenticated
+    transfers page. But it is exactly reconstructible, because every manager
+    starts Gameweek 2 with one free transfer -- Gameweek 1's transfers are
+    unlimited and free -- and ``roll_forward_free_transfers`` is deterministic
+    from there given the transfers made and the chips played, both of which
+    ``/entry/{id}/history/`` publishes.
+
+    Why not just carry the number forward in ``decision_log``, which is what
+    the engine did until now: the log records what the bot ADVISED. There is
+    no submission path (removed 2026-08-18), so a human enters the team and
+    may decline a transfer, make a different one, or take a hit the bot did
+    not plan -- and from that week on the stored allowance is wrong for the
+    rest of the season, with no way to notice. This is the same failure class
+    ``optimiser.chips.chips_played_this_season`` was written for.
+
+    ``transfers_cost`` is not used to drive the reconstruction, only to check
+    it: a hit costs 4 points per transfer beyond the allowance, so any week
+    with a hit pins the allowance exactly. A mismatch is logged loudly rather
+    than silently corrected, because it means either this model of FPL's rules
+    is wrong or the sync is stale, and both want a human.
+    """
+    if not entry_id or next_gw <= 1:
+        return None
+    trules = transfer_rules or TRANSFERS
+
+    db = get_session()
+    try:
+        rows = db.execute(
+            text(
+                "SELECT gameweek, transfers_made, transfers_cost FROM entry_gameweek "
+                "WHERE season = :season AND entry_id = :entry_id AND gameweek < :next_gw "
+                "ORDER BY gameweek"
+            ),
+            {"season": season, "entry_id": entry_id, "next_gw": next_gw},
+        ).fetchall()
+        chips = dict(
+            db.execute(
+                text(
+                    "SELECT gameweek, chip FROM chip_usage "
+                    "WHERE season = :season AND entry_id = :entry_id"
+                ),
+                {"season": season, "entry_id": entry_id},
+            ).fetchall()
+        )
+    finally:
+        db.close()
+
+    if not rows:
+        return None
+
+    # The walk is only as good as the last row in it. If the sync did not run,
+    # or ran against the wrong database, the newest gameweek here is older than
+    # the one before the decision and every transfer since is invisible -- and
+    # the answer would be confidently wrong rather than absent. Decline, and
+    # let the caller fall back to the log.
+    latest = max(row[0] for row in rows)
+    if latest < next_gw - 1:
+        logger.warning(
+            "FPL's record of entry %d stops at GW%d but GW%d is being decided, "
+            "so the free-transfer count cannot be reconstructed. Falling back "
+            "to the decision log. Has the ingest run?",
+            entry_id, latest, next_gw,
+        )
+        return None
+
+    # Gameweek 1 is unlimited and free, so the walk starts at the first
+    # gameweek an allowance exists in and everyone's is the same.
+    free_transfers = trules.free_transfers_per_gw
+    for gameweek, made, cost in rows:
+        if gameweek < 2:
+            continue
+        chip = chips.get(gameweek)
+        if cost and made - cost // 4 != free_transfers:
+            logger.error(
+                "Free-transfer reconstruction disagrees with FPL at GW%d: %d "
+                "transfers cost %d points, which means the allowance was %d, "
+                "but this walk had %d. Either the roll-forward rule is wrong "
+                "or the entry history is stale.",
+                gameweek, made, cost, made - cost // 4, free_transfers,
+            )
+        free_transfers = roll_forward_free_transfers(
+            free_transfers,
+            made,
+            wildcard_played=chip == "wildcard",
+            free_hit_played=chip == "freehit",
+            transfer_rules=trules,
+        )
+    logger.info(
+        "Free transfers for GW%d, reconstructed from FPL's record of entry %d: %d",
+        next_gw, entry_id, free_transfers,
+    )
+    return free_transfers
 
 
 def selling_price(purchase_price: float, now_cost: float) -> float:

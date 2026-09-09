@@ -96,25 +96,32 @@ def test_roll_forward_caps_at_the_banking_limit():
 
 
 def test_roll_forward_keeps_banked_transfers_through_a_wildcard():
-    """Regression, 2026-08-18 (engine review §10).
+    """Regression, 2026-08-18 (engine review §10), corrected 2026-09-09.
 
-    This used to assert ``== 1`` — that a wildcard RESET the allowance. That
-    is not FPL's rule: saved free transfers are retained across both a
-    Wildcard and a Free Hit. The Premier League's own worked example: two
-    saved before a GW6 wildcard leaves three for GW7 (two saved + GW7's
-    allotment). You just do not earn an extra one in the week you play it.
+    Two wrong answers have lived here. It first asserted ``== 1``, that a
+    wildcard RESET the allowance, which destroyed up to four banked transfers
+    per wildcard. The fix over-corrected to "saved transfers plus a fresh
+    weekly one", inventing a transfer every chip week.
 
-    The old behaviour destroyed up to four banked transfers per wildcard,
-    twice a season, and seeded ``ft[0]`` in the multi-period ILP with the
-    wrong number for every week after.
+    FPL's rule is that the allowance is UNCHANGED across a Wildcard or Free
+    Hit: your saved transfers are retained, but the chip consumes that
+    gameweek's own allotment, so nothing accrues on top. The Premier League's
+    worked example says so once the arithmetic is lined up — two saved after
+    the Gameweek 5 deadline means three available in Gameweek 6 (the two plus
+    Gameweek 6's), the wildcard consumes Gameweek 6's, and Gameweek 7 has
+    three again.
+
+    Confirmed on live data: entry 504618 went into Gameweek 3 with one free
+    transfer, played the Free Hit, and FPL showed **one** for Gameweek 4 while
+    this function returned two.
     """
-    # The PL's worked example, exactly.
-    assert roll_forward_free_transfers(2, 15, wildcard_played=True) == 3
-    # A full bank survives, subject to the cap.
-    assert roll_forward_free_transfers(4, 11, wildcard_played=True) == 5
+    # The PL's worked example, exactly: three in GW6, still three in GW7.
+    assert roll_forward_free_transfers(3, 15, wildcard_played=True) == 3
+    # A full bank survives, and does not grow past the cap.
+    assert roll_forward_free_transfers(4, 11, wildcard_played=True) == 4
     assert roll_forward_free_transfers(5, 15, wildcard_played=True) == 5
-    # And a manager on the bare allowance is unchanged.
-    assert roll_forward_free_transfers(1, 15, wildcard_played=True) == 2
+    # And a manager on the bare allowance stays on it -- the live GW3 case.
+    assert roll_forward_free_transfers(1, 15, wildcard_played=True) == 1
 
 
 def test_roll_forward_treats_both_free_squad_chips_alike():
@@ -129,10 +136,12 @@ def test_roll_forward_treats_both_free_squad_chips_alike():
 
 
 def test_roll_forward_free_hit_transfers_do_not_spend_the_allowance():
-    """A Free Hit squad is reverted, so its transfers never counted -- but
-    the weekly allowance still accrues (the backtest used to `pass` here,
-    keeping the count flat)."""
-    assert roll_forward_free_transfers(2, 15, free_hit_played=True) == 3
+    """A Free Hit squad is reverted, so its transfers never counted against
+    the allowance -- and no weekly transfer accrues on top of it either,
+    because the chip consumed that gameweek's."""
+    assert roll_forward_free_transfers(2, 15, free_hit_played=True) == 2
+    # The chip's own transfers are irrelevant: 15 or 0, the answer is the same.
+    assert roll_forward_free_transfers(2, 0, free_hit_played=True) == 2
 
 
 def test_roll_forward_banks_to_the_cap_over_consecutive_quiet_weeks():

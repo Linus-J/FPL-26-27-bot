@@ -11,6 +11,7 @@ from data.ingestors.setpiece import ingest_fpl_setpiece_roles
 from data.models import (
     ChipUsage,
     ChipUsageSync,
+    EntryGameweek,
     Fixture,
     Gameweek,
     Player,
@@ -713,25 +714,72 @@ def upsert_entry_chips(history: dict, season: str, entry_id: int) -> int:
     return len(chips)
 
 
-async def ingest_entry_chips(season: str, entry_id: int) -> int | None:
-    """Best-effort. A missing FPL_TEAM_ID, a 404 from a wrong one or a network
-    blip must not take down an ingest run: the consumers fall back to the
-    recommendation log, which is what they used exclusively until 2026-09-09.
-    Returns the number of chips recorded, or None if we could not ask."""
+def upsert_entry_gameweeks(history: dict, season: str, entry_id: int) -> int:
+    """Write FPL's per-gameweek record for one entry: transfers made, the
+    points they cost, and the score.
+
+    The free-transfer allowance is reconstructed from these rows
+    (``optimiser.transfers.free_transfers_this_gameweek``). No sync marker,
+    unlike ``upsert_entry_chips`` -- see ``data.models.EntryGameweek`` for why
+    an empty gameweek list is not the ambiguous answer an empty chip list is.
+    """
+    events = history.get("current") or []
+    now = datetime.utcnow()
+    db = get_session()
+    written = 0
+    try:
+        for event in events:
+            gw = event.get("event")
+            if gw is None:
+                logger.warning("Skipping malformed entry gameweek from FPL: %r", event)
+                continue
+            db.execute(
+                insert(EntryGameweek)
+                .values(
+                    season=season, entry_id=entry_id, gameweek=int(gw),
+                    transfers_made=int(event.get("event_transfers") or 0),
+                    transfers_cost=int(event.get("event_transfers_cost") or 0),
+                    points=event.get("points"),
+                    synced_at=now,
+                )
+                .on_conflict_do_update(
+                    index_elements=["season", "entry_id", "gameweek"],
+                    set_={
+                        "transfers_made": int(event.get("event_transfers") or 0),
+                        "transfers_cost": int(event.get("event_transfers_cost") or 0),
+                        "points": event.get("points"),
+                        "synced_at": now,
+                    },
+                )
+            )
+            written += 1
+        db.commit()
+    finally:
+        db.close()
+    logger.info(
+        "Entry history for %d, %s: %d gameweeks recorded", entry_id, season, written
+    )
+    return written
+
+
+async def ingest_entry_history(season: str, entry_id: int) -> None:
+    """One fetch, two facts: which chips were played and what was done each
+    gameweek. They come from the same payload and there is no reason to ask
+    twice."""
     if not entry_id:
         logger.warning(
-            "FPL_TEAM_ID is unset, so chip usage cannot be read from FPL. "
-            "Chip availability will be inferred from the bot's own "
-            "recommendation log, which records what it ADVISED, not what was "
-            "played."
+            "FPL_TEAM_ID is unset, so neither chip usage nor the free-transfer "
+            "count can be read from FPL. Both fall back to the bot's own "
+            "recommendation log, which records what it ADVISED, not what was done."
         )
-        return None
+        return
     try:
         history = await fetch_entry_history(entry_id)
     except (TimeoutError, aiohttp.ClientError) as exc:
-        logger.warning("Could not read chip usage for entry %d: %s", entry_id, exc)
-        return None
-    return upsert_entry_chips(history, season, entry_id)
+        logger.warning("Could not read history for entry %d: %s", entry_id, exc)
+        return
+    upsert_entry_chips(history, season, entry_id)
+    upsert_entry_gameweeks(history, season, entry_id)
 
 
 async def run_full_ingest(season: str = "2026-27") -> None:
@@ -751,9 +799,10 @@ async def run_full_ingest(season: str = "2026-27") -> None:
     raw_fixtures = await fetch_fixtures()
     upsert_fixtures(raw_fixtures, season)
 
-    # Ground truth for which chips have actually been played, as opposed to
-    # which ones the bot recommended (2026-09-09). Best-effort by design.
-    await ingest_entry_chips(season, settings.fpl_team_id)
+    # Ground truth for what the entry actually did -- which chips were played
+    # and how many transfers were made each week, as opposed to what the bot
+    # recommended (2026-09-09). Best-effort by design.
+    await ingest_entry_history(season, settings.fpl_team_id)
 
     db = get_session()
     try:

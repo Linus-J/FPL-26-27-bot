@@ -843,3 +843,48 @@ class ChipUsageSync(Base):
     entry_id: Mapped[int] = mapped_column(Integer, nullable=False)
     chips_seen: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     synced_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class EntryGameweek(Base):
+    """What the entry ACTUALLY did each gameweek, from the same
+    ``/entry/{id}/history/`` payload as ``ChipUsage``.
+
+    Exists for the free-transfer count, which nothing publishes directly: FPL
+    states it only on the authenticated transfers page. It is exactly
+    reconstructible from this table though, because everyone starts Gameweek 2
+    with one free transfer (Gameweek 1's transfers are unlimited and free) and
+    ``optimiser.transfers.roll_forward_free_transfers`` is deterministic from
+    there -- see ``free_transfers_this_gameweek``.
+
+    Reconstructing it from ``decision_log`` instead is the mistake
+    ``ChipUsage`` was created to stop: the log records what the bot ADVISED,
+    and an operator who declines a transfer, or makes one of their own, leaves
+    the stored allowance wrong for the rest of the season.
+
+    Unlike ``ChipUsage`` this needs no sync marker. An empty chip list is a
+    real answer ("nothing played yet") and so is indistinguishable from never
+    having asked; an empty gameweek list is not, because an entry that has
+    played a gameweek always has a row. No rows means either nobody asked or
+    the season has not started, and both take the fallback.
+    """
+
+    __tablename__ = "entry_gameweek"
+    __table_args__ = (
+        UniqueConstraint("season", "entry_id", "gameweek", name="uq_entry_gameweek"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    season: Mapped[str] = mapped_column(String(7), nullable=False)
+    entry_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    gameweek: Mapped[int] = mapped_column(Integer, nullable=False)
+    # FPL reports 0 transfers in a Free Hit gameweek even though the squad was
+    # rebuilt -- verified against entry 504618's GW3, where
+    # `/entry/504618/transfers/` lists the moves and `event_transfers` is 0.
+    # The reconstruction zeroes chip weeks explicitly anyway.
+    transfers_made: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 4 x the number of transfers beyond the allowance, so it pins the
+    # allowance exactly whenever a hit was taken. Used to CHECK the
+    # reconstruction rather than to drive it.
+    transfers_cost: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    points: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    synced_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

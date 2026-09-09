@@ -191,9 +191,13 @@ async def _unreachable(entry_id):
     raise AssertionError("must not call FPL without an entry id")
 
 
-def test_no_entry_id_configured_does_not_call_fpl(session, monkeypatch):
+def test_no_entry_id_configured_does_not_call_fpl(session, monkeypatch, caplog):
     """FPL_TEAM_ID defaults to 0. Asking about entry 0 is a guaranteed 404
     every run, and the warning has to name the consequence."""
     import asyncio
     monkeypatch.setattr(fpl_api, "fetch_entry_history", _unreachable)
-    assert asyncio.run(fpl_api.ingest_entry_chips(SEASON, 0)) is None
+    with caplog.at_level("WARNING"):
+        asyncio.run(fpl_api.ingest_entry_history(SEASON, 0))
+    assert "FPL_TEAM_ID is unset" in caplog.text
+    assert "recommendation log" in caplog.text
+    assert session.execute(select(ChipUsage)).all() == []

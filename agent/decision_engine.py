@@ -41,6 +41,7 @@ from optimiser.squad import optimise_squad_joint, optimise_starting_xi
 from optimiser.transfers import (
     TransferPlan,
     evaluate_transfers,
+    free_transfers_this_gameweek,
     get_dgw_coverage,
     roll_forward_free_transfers,
     selling_price,
@@ -627,7 +628,24 @@ def _run_decision_cycle(
     state = _load_squad_state(sim_manager_id, team_id, config, decided_gw=next_gw)
     squad_ids = state.squad_ids
     available_budget = state.budget
+    # Ground truth from FPL for the real entry, the carried-forward log value
+    # for everything else -- the same split as `chips_played_this_season`
+    # below, and for the same reason. `state.free_transfers` is what the bot
+    # RECOMMENDED rolling forward; an operator who declines a transfer or takes
+    # an unplanned hit leaves it wrong for the rest of the season.
     free_transfers = state.free_transfers
+    from_fpl = free_transfers_this_gameweek(
+        season, team_id if sim_manager_id is None else None, next_gw,
+        transfer_rules=transfer_rules,
+    )
+    if from_fpl is not None and from_fpl != free_transfers:
+        logger.warning(
+            "Free transfers: FPL's record of entry %s gives %d for GW%d, the "
+            "decision log carried %d. Using FPL's.",
+            team_id, from_fpl, next_gw, free_transfers,
+        )
+    if from_fpl is not None:
+        free_transfers = from_fpl
 
     # THIRD gap, found 2026-08-16 by auditing the decision log: this branched
     # on `projections.empty`, which is a fact about what happens to be
