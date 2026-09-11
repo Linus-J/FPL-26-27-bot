@@ -2,7 +2,7 @@
   "schema_version": 1,
   "gameweek": 4,
   "label": "GW4 \u2014 12 Sep 2026",
-  "generated_at": "2026-09-11T23:50:50.216402+00:00",
+  "generated_at": "2026-09-11T23:58:33.589246+00:00",
   "squad": [
     {
       "player_id": 1,
@@ -508,7 +508,8 @@
       "gameweek": 3,
       "type": "chip",
       "chip": "freehit",
-      "reason": "beats no-chip by 11.1 xPts \u2014 free hit: 68.45 xPts"
+      "reason": "beats no-chip by 11.1 xPts \u2014 free hit: 68.45 xPts",
+      "net_xpts_gain": 11.058381098233099
     },
     {
       "gameweek": 2,
@@ -528,7 +529,8 @@
       "gameweek": 2,
       "type": "chip",
       "chip": "3xc",
-      "reason": "TC captain xPts 7.8"
+      "reason": "TC captain xPts 7.8",
+      "net_xpts_gain": 7.805848416842972
     },
     {
       "gameweek": 1,

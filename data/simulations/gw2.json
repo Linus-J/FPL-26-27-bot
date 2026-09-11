@@ -506,7 +506,8 @@
       "gameweek": 2,
       "type": "chip",
       "chip": "3xc",
-      "reason": "TC captain xPts 7.8"
+      "reason": "TC captain xPts 7.8",
+      "net_xpts_gain": 7.805848416842972
     },
     {
       "gameweek": 1,
