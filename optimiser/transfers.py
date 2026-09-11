@@ -5,7 +5,14 @@ import pandas as pd
 import pulp
 from sqlalchemy import text
 
-from config.strategy import OPTIMISER, SQUAD, TRANSFERS, OptimiserConfig, TransferRules
+from config.strategy import (
+    DEPARTURE_RISK,
+    OPTIMISER,
+    SQUAD,
+    TRANSFERS,
+    OptimiserConfig,
+    TransferRules,
+)
 from data.db import get_session
 from data.overrides import load_excluded_player_ids
 from optimiser.bench_weights import bench_gk_weight_for_week, bench_slot_weight_for_week
@@ -26,6 +33,70 @@ class TransferPlan:
     hits_taken: int
     xpts_gain: float
     net_xpts_gain: float
+
+
+def pin_confirmed_departures(
+    prob: "pulp.LpProblem",
+    tin: dict,
+    tout: dict,
+    confirmed_departure_ids: "set[int] | list[int]",
+    horizon_xpts: "pd.Series | dict",
+    horizon_weeks: int,
+) -> None:
+    """Pin the sale of every confirmed departure / hand-vetoed player, and pin
+    it shut behind them.
+
+    WHICH WEEK the sale happens depends on whether the player is still worth
+    anything (2026-09-11). A departure the pipeline has already zeroed
+    contributes nothing to the squad this week or next, so pinning the sale to
+    week 0 spent the free transfer on a slot that was dead either way. Live on
+    the GW4 2026-27 frame: Neave (status 'u', 0 xPts) had to go, the only
+    replacement affordable on a 0.0 bank projected 0 xPts, so buying a forward
+    who would actually play needed money, so Tarkowski was sold to raise it and
+    the week cost a -4. The forced timing, not the forced sale, was worth ~1.9
+    xPts of plan quality.
+
+    So dead weight is sold SOMEWHERE in the horizon and the optimiser picks the
+    week -- it is a money chip, cashed when cashing it is free. The sale stays
+    mandatory because a permanently dead 15th slot costs real points through
+    Bench Boost and auto-subs.
+
+    A departure still projecting points keeps the week-0 pin. That is what
+    holds the hand-veto path (which shares this set, and whose players keep
+    their real xPts) to its stated meaning: the manager's judgement is not up
+    for negotiation, so it cannot be deferred into next week on the optimiser's
+    say-so.
+
+    ...AND THEY STAY SOLD, which is the second half and used to be missing.
+    An owned vetoed player is deliberately left in the candidate pool by the
+    caller -- he has to be, or there would be no ``tout`` variable to force --
+    and the only other pin on ``tin`` is the week-0 "you cannot buy someone you
+    already own" sanity constraint. So nothing stopped the model selling him at
+    week 0 and buying him straight back at week 1: a veto that expired after
+    one gameweek.
+
+    It is worth knowing why that bug cannot be caught through
+    ``evaluate_transfers``'s return value, because a good deal of effort went
+    into trying (2026-09-11). Only week 0 is ever reported; weeks 1..H-1 are
+    discarded once they have informed it. And the buy-back cannot perturb week
+    0 either, for two structural reasons: a one-for-one swap is funded by
+    selling whatever was bought at week 0, so it conserves cash, the club slot
+    and the positional slot alike; and hits are priced linearly, so every
+    transfer decision decouples from every other one. Sweeping a rival upgrade
+    across the -4 boundary gives byte-identical plans with the pin and without
+    it -- while the solved model plainly shows ``tin`` set at week 1. The
+    buy-back is a PHANTOM: next week's run no longer owns him, so the candidate
+    filter drops him and the plan could never have been executed. It only
+    inflates this week's valuation. Hence the pin is tested here, on the model,
+    rather than through a squad scenario that cannot see it.
+    """
+    for pid in confirmed_departure_ids:
+        if float(horizon_xpts.get(pid, 0.0)) <= DEPARTURE_RISK.dead_weight_horizon_xpts:
+            prob += pulp.lpSum(tout[(pid, w)] for w in range(horizon_weeks)) == 1
+        else:
+            prob += tout[(pid, 0)] == 1
+        for w in range(horizon_weeks):
+            prob += tin[(pid, w)] == 0
 
 
 def roll_forward_free_transfers(
@@ -305,6 +376,21 @@ def evaluate_transfers(
         )
         free_transfers = trules.free_transfers_per_gw
     current_squad = players[players["id"].isin(current_squad_ids)].copy()
+    # Every constraint keys off the players frame, so a squad member missing
+    # from it has no squad/tin/tout variable at all: `in_current` would sum to
+    # 14 while squad_size still demands 15, and the model would close the gap
+    # by buying someone with nothing sold against them -- a free player, a plan
+    # whose purchases and sales do not balance, a 16-long new squad, and a bank
+    # priced off the 14 rows it could see. Nothing can be modelled on his
+    # behalf (no price, position or club), so refuse rather than guess.
+    # Confirmed departures are NOT this case: status='u' rows stay in bootstrap
+    # all season and are force-sold above. This is the row going away entirely.
+    missing = [pid for pid in current_squad_ids if pid not in set(current_squad["id"])]
+    if missing:
+        raise ValueError(
+            f"squad players missing from the player frame: {sorted(missing)} — "
+            "cannot plan transfers without their price, position and club"
+        )
     squad_now_cost = float(current_squad["now_cost"].sum())
     budget = available_budget or squad_now_cost
     # P1.6: cash not tied up in players. Derived from `budget` when the caller
@@ -457,14 +543,16 @@ def evaluate_transfers(
         prob += ft[0] == free_transfers
 
     # Departure-risk gate (§6.5): a confirmed departure (status='u') already
-    # owned must be sold immediately, not merely made ineligible to buy back
-    # (the generic "can't tin an owned player at w=0" constraint below
-    # already prevents re-buying) — forcing tout==1 here (rather than
-    # omitting them from the model, the prior behaviour) means they
-    # correctly show up in the reported transfers_out and go through the
-    # normal hit/FT accounting.
-    for pid in confirmed_departure_ids:
-        prob += tout[(pid, 0)] == 1
+    # owned must be sold, not merely made ineligible to buy back -- forcing
+    # tout==1 (rather than omitting them from the model, the prior behaviour)
+    # means they correctly show up in the reported transfers_out and go through
+    # the normal hit/FT accounting. See pin_confirmed_departures for which week
+    # the sale lands in, and for why it also has to be pinned shut behind them.
+    horizon_xpts = (
+        projections[projections["gameweek"].isin(gws)]
+        .groupby("player_id")["xpts"].sum()
+    )
+    pin_confirmed_departures(prob, tin, tout, confirmed_departure_ids, horizon_xpts, H)
 
     for w in range(H):
         for i, pid in enumerate(pid_list):
@@ -642,6 +730,16 @@ def evaluate_transfers(
             "cost": float(row["now_cost"].values[0]) if len(row) else 0.0,
         }
 
+    # Consumers read these two lists as PAIRS -- notifier.py zips them into
+    # "IN <- OUT" lines, the dashboard prints them as adjacent columns the eye
+    # reads row-by-row -- but both were built by walking `pid_list`, so each
+    # came out in player-id order independently of the other and the pairing
+    # was fiction. Reported live on GW4 2026-27: a forward shown arriving for a
+    # defender. Sorting both the same way makes the zip true for every consumer
+    # at once. It is well defined because `squad` is pinned to a fixed count
+    # per position every week, so the number sold at a position always equals
+    # the number bought at it; which same-position player pairs with which is
+    # arbitrary, hence web_name purely to keep the order stable.
     plan = TransferPlan(
         transfers_in=[_player_info(pid) for pid in gw0_in],
         transfers_out=[_player_info(pid) for pid in gw0_out],

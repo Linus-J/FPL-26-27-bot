@@ -752,6 +752,16 @@ class DepartureRiskRules:
     hard_exclude_p_leave: float = 0.7
     # p_leave below this -> no effect (too uncertain a rumour to act on).
     rumour_floor_p_leave: float = 0.2
+    # A force-sold player projecting no more than this ACROSS THE WHOLE
+    # planning horizon is dead weight: he scores nothing whether he is sold
+    # this week or next, so the sale stays mandatory but the optimiser picks
+    # the week. Above it, the sale is pinned to week 0 as before.
+    #
+    # 0.5 over a three-gameweek horizon is well clear of the exact 0.0 the
+    # pipeline writes for status i/u/s, and far below anything a player who
+    # might actually feature would project — so the two cases cannot be
+    # confused by a rounding artefact.
+    dead_weight_horizon_xpts: float = 0.5
     # Treat this GW range as a mini-preseason re-plan trigger (incoming
     # signings enter cold-start, outgoing players get the departure gate
     # applied proactively) — approximate, season-tunable.
