@@ -2,7 +2,7 @@
   "schema_version": 1,
   "gameweek": 4,
   "label": "GW4 \u2014 12 Sep 2026",
-  "generated_at": "2026-09-11T11:32:06.279761+00:00",
+  "generated_at": "2026-09-11T13:04:05.508209+00:00",
   "squad": [
     {
       "player_id": 1,
@@ -492,9 +492,9 @@
       "gameweek": 4,
       "type": "transfers",
       "transfers_in": [
+        "Thomas",
         "Enciso",
-        "Jo\u00e3o Pedro",
-        "Thomas"
+        "Jo\u00e3o Pedro"
       ],
       "transfers_out": [
         "Van Hecke",
@@ -514,12 +514,12 @@
       "gameweek": 2,
       "type": "transfers",
       "transfers_in": [
-        "Rice",
-        "Gu\u00e9hi"
+        "Gu\u00e9hi",
+        "Rice"
       ],
       "transfers_out": [
-        "Gibbs-White",
-        "Pedro Porro"
+        "Pedro Porro",
+        "Gibbs-White"
       ],
       "hits_taken": 1,
       "net_xpts_gain": 6.428560517084776
