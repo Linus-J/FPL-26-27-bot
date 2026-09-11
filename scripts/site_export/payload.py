@@ -204,6 +204,10 @@ def _chip_entry(row: pd.Series) -> dict:
         "type": "chip",
         "chip": details.get("chip"),
         "reason": details.get("reason", ""),
+        # The same key a transfers entry publishes, because the site reads
+        # every event in the log as a gain in xPts. The reason stays as the
+        # record of why the chip fired; it is not what the log renders.
+        "net_xpts_gain": float(row["projected_gain"]),
     }
 
 

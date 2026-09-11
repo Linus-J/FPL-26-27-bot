@@ -222,7 +222,24 @@ def test_build_history_entries_maps_transfers_and_chips_and_drops_lineup():
     }
     assert entries[1] == {
         "gameweek": 3, "type": "chip", "chip": "wildcard", "reason": "squad overhaul",
+        "net_xpts_gain": 0.0,
     }
+
+
+def test_a_chip_entry_carries_the_same_gain_key_a_transfer_entry_does():
+    """Every other event in the log is read as a gain in xPts, so a chip has
+    to publish one too -- the site had nothing to render but the engine's
+    free-form reason, which is prose where the rest of the column is a
+    number."""
+    history_df = pd.DataFrame([
+        {"gameweek": 2, "decision_type": "chip", "projected_gain": 7.805848, "details": {
+            "chip": "3xc", "reason": "TC captain xPts 7.8",
+        }},
+    ])
+
+    entries = payload_module._build_history_entries(history_df)
+
+    assert entries[0]["net_xpts_gain"] == 7.805848
 
 
 def _seed_full_squad(session):
@@ -489,7 +506,8 @@ def test_history_keeps_only_the_latest_chip_row_per_gameweek():
     ]))
 
     assert entries == [
-        {"gameweek": 2, "type": "chip", "chip": "3xc", "reason": "TC captain xPts 7.8"}
+        {"gameweek": 2, "type": "chip", "chip": "3xc", "reason": "TC captain xPts 7.8",
+         "net_xpts_gain": 7.8}
     ]
 
 
@@ -604,7 +622,8 @@ def test_history_reproduces_the_published_gw1_and_gw2_log():
          "transfers_in": ["Rice", "Guéhi"],
          "transfers_out": ["Gibbs-White", "Pedro Porro"],
          "hits_taken": 1, "net_xpts_gain": 6.4286},
-        {"gameweek": 2, "type": "chip", "chip": "3xc", "reason": "TC captain xPts 7.8"},
+        {"gameweek": 2, "type": "chip", "chip": "3xc", "reason": "TC captain xPts 7.8",
+         "net_xpts_gain": 7.8058},
         {"gameweek": 1, "type": "initial_squad"},
     ]
 
