@@ -71,11 +71,12 @@ def run(*, no_push: bool) -> None:
     # for up to seven days, so without this the site kept serving a
     # five-day-old squad (2026-08-30). Both files matter -- a fresh
     # gw{N}.json behind a stale index.json is still a stale page.
+    # A refreshed older file is pushed like any other change, so it needs
+    # purging for the same reason -- otherwise the site serves the corrected
+    # history for this week and the uncorrected one for every week before it.
     if committed and not no_push:
-        purge_cdn(
-            repo=CDN_REPO, ref=CDN_REF, path=CDN_PATH,
-            files=["index.json", run_path.name],
-        )
+        files = dict.fromkeys(["index.json", run_path.name, *(p.name for p in refreshed)])
+        purge_cdn(repo=CDN_REPO, ref=CDN_REF, path=CDN_PATH, files=list(files))
 
 
 def main() -> None:

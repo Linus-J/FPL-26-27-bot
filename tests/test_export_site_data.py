@@ -56,7 +56,7 @@ def test_run_wires_payload_write_index_and_commit_in_order(monkeypatch, tmp_path
 # files it just published.
 
 
-def _wire(monkeypatch, tmp_path, calls, *, committed=True):
+def _wire(monkeypatch, tmp_path, calls, *, committed=True, refreshed=()):
     fake_payload = {"gameweek": 3, "label": "GW3 — 3 Aug", "generated_at": "t"}
 
     def fake_write_run_file(out_dir, gw, payload):
@@ -66,7 +66,10 @@ def _wire(monkeypatch, tmp_path, calls, *, committed=True):
 
     monkeypatch.setattr(cli, "get_session", lambda: MagicMock())
     monkeypatch.setattr(cli, "build_run_payload", lambda db, team_id: fake_payload)
-    monkeypatch.setattr(cli, "refresh_from_db", lambda data_dir, db: [])
+    monkeypatch.setattr(
+        cli, "refresh_from_db",
+        lambda data_dir, db: [tmp_path / name for name in refreshed],
+    )
     monkeypatch.setattr(cli, "write_run_file", fake_write_run_file)
     monkeypatch.setattr(
         cli, "update_index",
@@ -92,6 +95,30 @@ def test_run_purges_the_index_and_the_run_file_after_pushing(monkeypatch, tmp_pa
     assert calls[0]["files"] == ["index.json", "gw3.json"], (
         "a fresh gw3.json behind a stale index.json is still a stale page"
     )
+
+
+def test_run_purges_the_older_files_the_refresh_rewrote(monkeypatch, tmp_path):
+    """A refreshed gw3.json is pushed like any other change, but the purge list
+    was fixed to the index and this week's run -- so the CDN would have gone on
+    serving the uncorrected history for up to seven days, which is exactly the
+    staleness the refresh exists to end."""
+    calls = []
+    _wire(monkeypatch, tmp_path, calls, refreshed=["gw2.json", "gw3.json"])
+
+    cli.run(no_push=False)
+
+    assert calls[0]["files"] == ["index.json", "gw3.json", "gw2.json"]
+
+
+def test_run_purges_each_file_once(monkeypatch, tmp_path):
+    """This week's run file is refreshed too when an earlier decision changed,
+    so it arrives from both sources."""
+    calls = []
+    _wire(monkeypatch, tmp_path, calls, refreshed=["gw3.json"])
+
+    cli.run(no_push=False)
+
+    assert calls[0]["files"] == ["index.json", "gw3.json"]
 
 
 def test_run_purges_the_ref_the_site_actually_fetches(monkeypatch, tmp_path):
