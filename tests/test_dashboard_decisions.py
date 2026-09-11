@@ -13,7 +13,7 @@ from dashboard.data.decisions import (
     get_latest_chip_plan,
     get_latest_transfer_plan,
 )
-from data.models import Base, DecisionLog, SimDecisionLog, SimManager
+from data.models import Base, DecisionLog, Player, SimDecisionLog, SimManager
 
 
 @pytest.fixture
@@ -98,3 +98,58 @@ def test_latest_transfer_plan_returns_most_recent(session):
     assert plan["hits_taken"] == 0
     assert plan["net_xpts_gain"] == 3.2
     assert plan["transfers_in"][0]["web_name"] == "A"
+
+
+def _player(session, pid: int, name: str, position: str) -> None:
+    session.add(Player(
+        id=pid, fpl_id=pid, code=pid, first_name="f", second_name="s",
+        web_name=name, team_id=1, position=position, now_cost=5.0,
+    ))
+    session.commit()
+
+
+def test_transfer_plan_pairs_in_and_out_by_position(session):
+    """Historical rows have to be repaired on read, not just on write.
+
+    The optimiser now orders both lists by position, but rows written before
+    that fix are still stored crossed, and they carry no ``position`` key at
+    all -- so the loader cannot simply sort what it is given. It looks the
+    positions up and sorts on those, which fixes the GW4 2026-27 row that
+    prompted the report as well as everything written since.
+    """
+    _player(session, 1, "in_def", "DEF")
+    _player(session, 2, "in_fwd", "FWD")
+    _player(session, 3, "out_fwd", "FWD")
+    _player(session, 4, "out_def", "DEF")
+    # stored crossed, and with no "position" key, exactly as GW4 2026-27 was
+    _log(session, 10, "transfers", {
+        "transfers_in": [
+            {"player_id": 2, "web_name": "in_fwd", "cost": 8.0},
+            {"player_id": 1, "web_name": "in_def", "cost": 5.0},
+        ],
+        "transfers_out": [
+            {"player_id": 4, "web_name": "out_def", "cost": 5.0},
+            {"player_id": 3, "web_name": "out_fwd", "cost": 8.0},
+        ],
+        "hits_taken": 1,
+    }, projected_gain=2.0)
+
+    plan = get_latest_transfer_plan(session)
+    pairs = list(zip(plan["transfers_in"], plan["transfers_out"], strict=True))
+    assert [(i["web_name"], o["web_name"]) for i, o in pairs] == [
+        ("in_def", "out_def"), ("in_fwd", "out_fwd")
+    ]
+    assert all(i["position"] == o["position"] for i, o in pairs)
+
+
+def test_transfer_plan_survives_players_missing_from_the_table(session):
+    """A departed player can leave the table; that must not drop the row."""
+    _log(session, 10, "transfers", {
+        "transfers_in": [{"player_id": 99, "web_name": "ghost", "cost": 5.0}],
+        "transfers_out": [{"player_id": 98, "web_name": "gone", "cost": 5.0}],
+        "hits_taken": 0,
+    }, projected_gain=1.0)
+
+    plan = get_latest_transfer_plan(session)
+    assert plan["transfers_in"][0]["web_name"] == "ghost"
+    assert plan["transfers_in"][0]["position"] == ""

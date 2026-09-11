@@ -7,8 +7,10 @@ from __future__ import annotations
 import json
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
+
+from config.strategy import POSITION_ORDER
 
 
 def get_decision_history(
@@ -74,10 +76,59 @@ def get_latest_transfer_plan(db: Session) -> dict | None:
     if not row:
         return None
     details = json.loads(row[0])
+    incoming = details.get("transfers_in", [])
+    outgoing = details.get("transfers_out", [])
+    positions = positions_for(db, incoming + outgoing)
     return {
         "gameweek": row[2],
-        "transfers_in": details.get("transfers_in", []),
-        "transfers_out": details.get("transfers_out", []),
+        "transfers_in": paired_order(incoming, positions),
+        "transfers_out": paired_order(outgoing, positions),
         "hits_taken": details.get("hits_taken", 0),
         "net_xpts_gain": row[1],
     }
+
+
+def positions_for(db: Session, transfers: list[dict]) -> dict[int, str]:
+    """Map player id -> position for every player named in ``transfers``.
+    Shared with the site export, which publishes the same pairs."""
+    ids = {t["player_id"] for t in transfers if t.get("player_id") is not None}
+    if not ids:
+        return {}
+    rows = db.execute(
+        text("SELECT id, position FROM players WHERE id IN :ids").bindparams(
+            bindparam("ids", expanding=True)
+        ),
+        {"ids": sorted(ids)},
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def paired_order(transfers: list[dict], positions: dict[int, str]) -> list[dict]:
+    """Order a transfer list by position so that zipping the in-list against
+    the out-list pairs each arriving player with the departing one they
+    actually replace.
+
+    The optimiser now emits both lists in this order, but rows logged before
+    that fix are stored crossed AND carry no ``position`` key, so sorting what
+    is stored would not be enough -- the position is looked up and attached
+    here. That repairs history as well as anything written since, and keeps the
+    invariant a property of the read path rather than of whichever writer
+    happened to produce the row.
+
+    A player who has left the game entirely may no longer have a row in
+    ``players``; he keeps an empty position and sorts to the end rather than
+    disappearing from a plan that really did transfer him.
+    """
+    enriched = [
+        {**t, "position": t.get("position") or positions.get(t.get("player_id"), "")}
+        for t in transfers
+    ]
+    # Position only, and nothing else: the sort is stable, so players who
+    # share a position -- or whose position could not be resolved at all --
+    # keep the order they were stored in. Any pairing among same-position
+    # swaps is equally true, so there is no second key worth imposing, and
+    # adding one would reshuffle rows the fix has no business touching.
+    return sorted(
+        enriched,
+        key=lambda t: POSITION_ORDER.get(t["position"], len(POSITION_ORDER)),
+    )

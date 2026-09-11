@@ -14,6 +14,13 @@ from dataclasses import dataclass, replace
 # prior seasons changed assist/CS rules).
 # ---------------------------------------------------------------------------
 
+# FPL's own ordering of the positions. Single source of truth because it is
+# what makes an in/out transfer pairing well defined: sorting both lists by it
+# lines them up position-for-position (2026-09-11 -- Telegram and the dashboard
+# had been pairing a forward with a defender).
+POSITION_ORDER = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
+
+
 @dataclass(frozen=True)
 class ScoringRules:
     # --- Minutes played ---

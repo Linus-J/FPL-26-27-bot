@@ -6,7 +6,7 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from dashboard.data.decisions import get_decision_history
+from dashboard.data.decisions import get_decision_history, paired_order, positions_for
 from dashboard.data.squad import get_current_squad
 from data.models import Gameweek
 from projection.pipeline import _get_current_season, get_latest_projections
@@ -176,13 +176,22 @@ def _build_top15_entries(
     return entries
 
 
-def _transfers_entry(row: pd.Series) -> dict:
+def _transfers_entry(row: pd.Series, positions: dict[int, str]) -> dict:
+    """The site joins each list with commas and prints them either side of an
+    arrow, so the reader pairs them positionally. ``paired_order`` is what
+    makes that pairing true -- the stored lists are in players-frame row
+    order and cross each other. Shared with the dashboard so the two
+    surfaces cannot drift into disagreeing about the same decision."""
     details = row["details"]
     return {
         "gameweek": int(row["gameweek"]),
         "type": "transfers",
-        "transfers_in": [t["web_name"] for t in details.get("transfers_in", [])],
-        "transfers_out": [t["web_name"] for t in details.get("transfers_out", [])],
+        "transfers_in": [
+            t["web_name"] for t in paired_order(details.get("transfers_in", []), positions)
+        ],
+        "transfers_out": [
+            t["web_name"] for t in paired_order(details.get("transfers_out", []), positions)
+        ],
         "hits_taken": details.get("hits_taken", 0),
         "net_xpts_gain": float(row["projected_gain"]),
     }
@@ -287,7 +296,11 @@ def _transferred_in_ids(history_df: pd.DataFrame, gw: int) -> set[int]:
     }
 
 
-def _build_history_entries(history_df: pd.DataFrame, up_to_gw: int | None = None) -> list[dict]:
+def _build_history_entries(
+    history_df: pd.DataFrame,
+    up_to_gw: int | None = None,
+    positions: dict[int, str] | None = None,
+) -> list[dict]:
     """One published event per decision per gameweek, newest gameweek first.
 
     ``decision_log`` gets a fresh row every time the weekly pipeline runs,
@@ -337,7 +350,7 @@ def _build_history_entries(history_df: pd.DataFrame, up_to_gw: int | None = None
         # A chip-explained no-op is authoritative but not an event of its
         # own -- the chip entry below already says why nothing transferred.
         if transfers_row is not None and not _is_no_op_transfer(transfers_row):
-            entries.append(_transfers_entry(transfers_row))
+            entries.append(_transfers_entry(transfers_row, positions or {}))
 
         if chip_row is not None:
             entries.append(_chip_entry(chip_row))
@@ -347,6 +360,18 @@ def _build_history_entries(history_df: pd.DataFrame, up_to_gw: int | None = None
             entries.append({"gameweek": gw, "type": "initial_squad"})
 
     return entries
+
+
+def _history_positions(db: Session, history_df: pd.DataFrame) -> dict[int, str]:
+    """Positions for every player named in any transfers row of the history,
+    looked up once rather than per entry."""
+    if history_df.empty:
+        return {}
+    named: list[dict] = []
+    for details in history_df[history_df["decision_type"] == "transfers"]["details"]:
+        named.extend(details.get("transfers_in", []))
+        named.extend(details.get("transfers_out", []))
+    return positions_for(db, named)
 
 
 def build_run_payload(db: Session, team_id: int) -> dict:
@@ -369,5 +394,7 @@ def build_run_payload(db: Session, team_id: int) -> dict:
         "generated_at": datetime.now(UTC).isoformat(),
         "squad": _build_squad_entries(squad_df, dist, _transferred_in_ids(history_df, gw)),
         "top15": _build_top15_entries(projections_df, dist, team_names),
-        "history": _build_history_entries(history_df, up_to_gw=gw),
+        "history": _build_history_entries(
+            history_df, up_to_gw=gw, positions=_history_positions(db, history_df)
+        ),
     }

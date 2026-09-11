@@ -38,12 +38,17 @@ else:
         f"**GW{transfer_plan['gameweek']}** — hits taken: {transfer_plan['hits_taken']}, "
         f"net xPts gain: {transfer_plan['net_xpts_gain']:.2f}"
     )
-    col1, col2 = st.columns(2)
-    with col1:
-        st.write("In")
-        for p in transfer_plan["transfers_in"]:
-            st.write(f"- {p['web_name']} (£{p['cost']}m)")
-    with col2:
-        st.write("Out")
-        for p in transfer_plan["transfers_out"]:
-            st.write(f"- {p['web_name']} (£{p['cost']}m)")
+    # Two adjacent columns invited the eye to pair them row-by-row, which was
+    # only ever meaningful by luck. evaluate_transfers now orders both lists by
+    # position so the rows genuinely correspond, and showing them as explicit
+    # pairs says so rather than leaving the reader to assume it. Rows written
+    # before positions were recorded fall back to the bare name.
+    for incoming, outgoing in zip(
+        transfer_plan["transfers_in"], transfer_plan["transfers_out"]
+    ):
+        position = incoming.get("position") or outgoing.get("position") or ""
+        label = f"**{position}** " if position else ""
+        st.write(
+            f"- {label}{outgoing['web_name']} (£{outgoing['cost']}m) → "
+            f"{incoming['web_name']} (£{incoming['cost']}m)"
+        )

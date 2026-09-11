@@ -8,6 +8,7 @@ from sqlalchemy import text
 from config.strategy import (
     DEPARTURE_RISK,
     OPTIMISER,
+    POSITION_ORDER,
     SQUAD,
     TRANSFERS,
     OptimiserConfig,
@@ -728,6 +729,7 @@ def evaluate_transfers(
             "player_id": pid,
             "web_name": row["web_name"].values[0] if len(row) else str(pid),
             "cost": float(row["now_cost"].values[0]) if len(row) else 0.0,
+            "position": row["position"].values[0] if len(row) else "",
         }
 
     # Consumers read these two lists as PAIRS -- notifier.py zips them into
@@ -740,9 +742,12 @@ def evaluate_transfers(
     # per position every week, so the number sold at a position always equals
     # the number bought at it; which same-position player pairs with which is
     # arbitrary, hence web_name purely to keep the order stable.
+    def _pair_order(info: dict) -> int:
+        return POSITION_ORDER.get(info["position"], len(POSITION_ORDER))
+
     plan = TransferPlan(
-        transfers_in=[_player_info(pid) for pid in gw0_in],
-        transfers_out=[_player_info(pid) for pid in gw0_out],
+        transfers_in=sorted((_player_info(pid) for pid in gw0_in), key=_pair_order),
+        transfers_out=sorted((_player_info(pid) for pid in gw0_out), key=_pair_order),
         hits_taken=actual_hits,
         xpts_gain=xpts_gain,
         net_xpts_gain=net_xpts_gain,

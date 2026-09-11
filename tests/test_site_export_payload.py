@@ -894,3 +894,65 @@ def test_run_payload_marks_agree_with_the_published_history(session, monkeypatch
     marked = {e["web_name"] for e in payload["squad"] if e["transferred_in"]}
     came_in = set(payload["history"][0]["transfers_in"])
     assert marked == came_in == {"Haaland"}
+
+
+# The site's timeline renders "out, out, out → in, in, in" as two joined
+# lists, which a reader pairs positionally. That is only meaningful if the
+# two agree position-for-position, and stored rows do not: they were logged
+# in players-frame row order, independently of each other (2026-09-11, GW4 --
+# the page read "Van Hecke, Semenyo, Neave → Thomas, Enciso, João Pedro",
+# pairing a defender's sale with a midfielder's arrival). The dashboard
+# repairs this on read; the export has to do the same or the site keeps
+# publishing the crossed version.
+
+
+def test_transfer_names_are_published_in_a_position_matched_order():
+    entries = payload_module._build_history_entries(
+        _history_df([
+            {"gameweek": 4, "decision_type": "transfers", "projected_gain": 3.0, "details": {
+                "transfers_in": [
+                    {"web_name": "Thomas", "player_id": 1},
+                    {"web_name": "Enciso", "player_id": 2},
+                    {"web_name": "João Pedro", "player_id": 3},
+                ],
+                "transfers_out": [
+                    {"web_name": "Van Hecke", "player_id": 4},
+                    {"web_name": "Semenyo", "player_id": 5},
+                    {"web_name": "Neave", "player_id": 6},
+                ],
+                "hits_taken": 2,
+            }},
+        ]),
+        positions={1: "DEF", 2: "MID", 3: "FWD", 4: "DEF", 5: "MID", 6: "FWD"},
+    )
+
+    entry = entries[0]
+    assert entry["transfers_in"] == ["Thomas", "Enciso", "João Pedro"]
+    assert entry["transfers_out"] == ["Van Hecke", "Semenyo", "Neave"]
+
+
+def test_a_crossed_stored_row_is_straightened_before_publication():
+    """The order actually on disk for GW4: each list independently sorted,
+    so the in-list ran DEF, MID, FWD while the out-list ran MID, DEF, FWD."""
+    entries = payload_module._build_history_entries(
+        _history_df([
+            {"gameweek": 4, "decision_type": "transfers", "projected_gain": 3.0, "details": {
+                "transfers_in": [
+                    {"web_name": "Enciso", "player_id": 2},
+                    {"web_name": "João Pedro", "player_id": 3},
+                    {"web_name": "Thomas", "player_id": 1},
+                ],
+                "transfers_out": [
+                    {"web_name": "Van Hecke", "player_id": 4},
+                    {"web_name": "Semenyo", "player_id": 5},
+                    {"web_name": "Neave", "player_id": 6},
+                ],
+                "hits_taken": 2,
+            }},
+        ]),
+        positions={1: "DEF", 2: "MID", 3: "FWD", 4: "DEF", 5: "MID", 6: "FWD"},
+    )
+
+    assert list(zip(entries[0]["transfers_out"], entries[0]["transfers_in"])) == [
+        ("Van Hecke", "Thomas"), ("Semenyo", "Enciso"), ("Neave", "João Pedro"),
+    ]
