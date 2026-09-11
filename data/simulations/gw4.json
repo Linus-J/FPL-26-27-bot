@@ -2,7 +2,7 @@
   "schema_version": 1,
   "gameweek": 4,
   "label": "GW4 \u2014 12 Sep 2026",
-  "generated_at": "2026-09-11T23:16:52.500692+00:00",
+  "generated_at": "2026-09-11T23:50:50.216402+00:00",
   "squad": [
     {
       "player_id": 1,
@@ -508,7 +508,7 @@
       "gameweek": 3,
       "type": "chip",
       "chip": "freehit",
-      "reason": "beats no-chip by 15.1 xPts \u2014 free hit: 68.45 in GW3, then 1 FT into a continuation worth +25.44 (logged as 2 FTs: a chip week leaves the allowance unchanged, so the continuation and the margin were both optimistic)"
+      "reason": "beats no-chip by 11.1 xPts \u2014 free hit: 68.45 xPts"
     },
     {
       "gameweek": 2,

@@ -492,12 +492,12 @@
       "gameweek": 2,
       "type": "transfers",
       "transfers_in": [
-        "Rice",
-        "Gu\u00e9hi"
+        "Gu\u00e9hi",
+        "Rice"
       ],
       "transfers_out": [
-        "Gibbs-White",
-        "Pedro Porro"
+        "Pedro Porro",
+        "Gibbs-White"
       ],
       "hits_taken": 1,
       "net_xpts_gain": 6.428560517084776

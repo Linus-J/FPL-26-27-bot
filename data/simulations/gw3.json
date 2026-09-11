@@ -492,18 +492,18 @@
       "gameweek": 3,
       "type": "chip",
       "chip": "freehit",
-      "reason": "beats no-chip by 15.1 xPts \u2014 free hit: 68.45 in GW3, then 2 FT(s) into a continuation worth +25.44"
+      "reason": "beats no-chip by 11.1 xPts \u2014 free hit: 68.45 xPts"
     },
     {
       "gameweek": 2,
       "type": "transfers",
       "transfers_in": [
-        "Rice",
-        "Gu\u00e9hi"
+        "Gu\u00e9hi",
+        "Rice"
       ],
       "transfers_out": [
-        "Gibbs-White",
-        "Pedro Porro"
+        "Pedro Porro",
+        "Gibbs-White"
       ],
       "hits_taken": 1,
       "net_xpts_gain": 6.428560517084776
