@@ -37,13 +37,16 @@ def test_assert_rate_only_guard():
 # --- rolling window must not silently discard the newest gameweek -------------
 # 2026-08-18, engine review §20.
 
-def _history(n_gws: int, cbit_by_gw: dict[int, int]):
+def _history(n_gws: int, cbit_by_gw: dict[int, int],
+             xg_by_gw: dict[int, float] | None = None):
     import pandas as pd
 
+    xg_by_gw = xg_by_gw or {}
     hist = pd.DataFrame([
         {"player_id": 1, "gameweek": gw, "season": "2026-27", "position": "DEF",
          "team_id_season": 1, "opponent_team_id": 2, "was_home": True,
-         "minutes": 90, "total_points": 6, "xg": 0.0, "npxg": 0.0, "xa": 0.0,
+         "minutes": 90, "total_points": 6,
+         "xg": float(xg_by_gw.get(gw, 0.0)), "npxg": 0.0, "xa": 0.0,
          "key_passes": 0.0, "yellow_cards": 0, "red_cards": 0}
         for gw in range(1, n_gws + 1)
     ])
@@ -112,12 +115,23 @@ def test_rolling_rates_never_see_the_target_gameweek():
 
 # --- prior-season blending (engine review §20 follow-up) ---------------------
 
-def _prior(cbit_per_match: float):
+def _prior(cbit_per_match: float, xg_per_match: float = 0.0):
     import pandas as pd
 
     return pd.DataFrame(
-        {"cbit": [cbit_per_match], "cbirt": [cbit_per_match]}, index=[1]
+        {"cbit": [cbit_per_match], "cbirt": [cbit_per_match],
+         "xg": [xg_per_match]}, index=[1]
     ).rename_axis("player_id")
+
+
+# These exercise the blend through ``xg``/``goal_weight`` rather than the
+# defcon rates they originally used. The mechanism is unchanged; what changed
+# (2026-09-11) is that the strength is now calibrated per rate, and the
+# defensive-action volumes calibrated to k=0 — so ``defcon_rate`` is
+# deliberately no longer blended and can no longer demonstrate blending. See
+# tests/test_prior_season_blend.py, and the test directly below for the
+# pass-through that replaced it.
+_XG_BLEND_GWS = 20.0
 
 
 def test_early_season_rate_leans_on_last_season():
@@ -126,16 +140,29 @@ def test_early_season_rate_leans_on_last_season():
     before §20, exactly zero — while a whole prior season of real per-match
     rates sat unused.
 
-    Weight is by sample size: with one played gameweek and a prior worth three,
-    the current season gets 1/(1+3) = 25%.
+    Weight is by sample size: with one played gameweek and a prior worth
+    ``_XG_BLEND_GWS``, the current season gets 1/(1+k).
     """
     from projection.assemble import _build_rolling_features
 
-    hist, defcon = _history(1, {1: 20})
+    hist, defcon = _history(1, {1: 0}, xg_by_gw={1: 20.0})
     blended = _build_rolling_features(
+        hist, defcon, prior_rates=_prior(0.0, xg_per_match=4.0)
+    ).loc[1, "goal_weight"]
+    w = 1.0 / (1.0 + _XG_BLEND_GWS)
+    assert blended == pytest.approx(w * 20.0 + (1 - w) * 4.0)
+
+
+def test_defensive_volume_is_left_on_its_current_season_rate():
+    """The k=0 half of the calibration, at the level the engine actually runs:
+    a prior-season CBIT of 4 must not pull a current-season 20 down at all."""
+    from projection.assemble import _build_rolling_features
+
+    hist, defcon = _history(1, {1: 20})
+    rate = _build_rolling_features(
         hist, defcon, prior_rates=_prior(4.0)
     ).loc[1, "defcon_rate"]
-    assert blended == pytest.approx(0.25 * 20.0 + 0.75 * 4.0)
+    assert rate == pytest.approx(20.0)
 
 
 def test_the_current_season_takes_over_as_it_accumulates():
@@ -145,14 +172,15 @@ def test_the_current_season_takes_over_as_it_accumulates():
 
     weights = []
     for n in (1, 2, 3, 4):
-        hist, defcon = _history(n, dict.fromkeys(range(1, n + 1), 20))
+        hist, defcon = _history(n, dict.fromkeys(range(1, n + 1), 0),
+                                xg_by_gw=dict.fromkeys(range(1, n + 1), 20.0))
         rate = _build_rolling_features(
-            hist, defcon, prior_rates=_prior(0.0)
-        ).loc[1, "defcon_rate"]
+            hist, defcon, prior_rates=_prior(0.0, xg_per_match=0.0)
+        ).loc[1, "goal_weight"]
         weights.append(rate / 20.0)          # share of the blend the season holds
     assert weights == sorted(weights), "current-season weight must be monotonic"
-    assert weights[0] == pytest.approx(0.25)
-    assert weights[-1] == pytest.approx(4 / 7)
+    assert weights[0] == pytest.approx(1 / (1 + _XG_BLEND_GWS))
+    assert weights[-1] == pytest.approx(4 / (4 + _XG_BLEND_GWS))
 
 
 def test_a_player_with_no_prior_season_keeps_their_own_rate():
@@ -166,3 +194,30 @@ def test_a_player_with_no_prior_season_keeps_their_own_rate():
     empty_prior = pd.DataFrame(columns=["cbit", "cbirt"]).rename_axis("player_id")
     rate = _build_rolling_features(hist, defcon, prior_rates=empty_prior).loc[1, "defcon_rate"]
     assert rate == pytest.approx(20.0)
+
+
+# --- enrichment must not be blanked for an unplayed gameweek ------------------
+# 2026-09-11. ``load_player_enrichment`` selects ``FROM player_gw_stats``, so it
+# structurally cannot contain a row for a gameweek that has not been played.
+# ``predict_minutes_bands``'s as-of row lives at exactly that gameweek, so its
+# enrichment merge missed and every column fell back to its 0.0 default.
+#
+# Measured on the live 2026-27 database at GW4: the set-piece block and the
+# transfer-momentum block were zero for all 615 served players, against
+# training rows where 21% were set-piece takers and momentum was signed and
+# non-zero. Summed served P(60+) was 155.2 against a realised 210.3 starters
+# per gameweek, and the league-wide maximum was 0.811 -- no player, however
+# nailed, could be predicted to start. Carrying the two blocks forward moved
+# the sum to 218.4 and the maximum to 0.972.
+
+def _enrichment(rows):
+    import pandas as pd
+
+    return pd.DataFrame([
+        {"player_id": pid, "gameweek": gw, "season": "2026-27",
+         "is_penalty_taker": ipt, "penalty_xg_per_game": 0.0,
+         "is_set_piece_taker": ispt, "key_passes_per_game": kpg,
+         "injury_severity": 0.0, "price_momentum": pm, "transfer_velocity": 0.0}
+        for pid, gw, ipt, ispt, kpg, pm in rows
+    ])
+

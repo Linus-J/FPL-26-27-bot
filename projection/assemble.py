@@ -527,6 +527,36 @@ def load_penalty_duty(season: str) -> dict[int, float]:
 # the other heuristic constants; 0.0 disables blending exactly.
 _PRIOR_SEASON_BLEND_GWS = 3.0
 
+# Per-rate calibration of the constant above (2026-09-11). Walk-forward over
+# 2023-24, 2024-25 and 2025-26: for every played match, predict its realised
+# per-match value from the blended rate as-of the gameweek before, and pick the
+# k that minimises MSE. See tests/test_prior_season_blend.py for the full
+# table, the per-season stability check, and the caveat on cbit/cbirt.
+#
+# The headline is that ONE constant is the wrong shape. The attacking and card
+# rates want far more shrinkage than 3.0 -- their MSE is still falling at
+# k=20 and flat to k=40, because a rate measured over three matches of xG is
+# very nearly noise. The defensive-action volumes want NONE: cbit/cbirt get
+# monotonically worse with any prior weight at all, which is what a
+# role-and-tactics volume stat should do, since it does not survive a transfer
+# or a new manager the way a finishing rate does.
+#
+# Anything absent here keeps the untuned 3.0. ``dribbles`` is listed
+# explicitly at 3.0 rather than omitted because it was measured and its curve
+# is genuinely flat (k=2 beats k=3 by 0.3%), not because it was never looked
+# at -- the distinction matters to whoever revisits this.
+_PRIOR_SEASON_BLEND_GWS_BY_RATE: dict[str, float] = {
+    "xg": 20.0,
+    "npxg": 20.0,
+    "xa": 20.0,
+    "key_passes": 20.0,
+    "yellow_cards": 20.0,
+    "red_cards": 20.0,
+    "cbit": 0.0,
+    "cbirt": 0.0,
+    "dribbles": 3.0,
+}
+
 _PRIOR_RATE_SOURCES = (
     "xg", "npxg", "xa", "key_passes", "yellow_cards", "red_cards",
     "cbit", "cbirt", "dribbles",
@@ -573,7 +603,7 @@ def _blend_toward_prior(
     played: pd.Series,
     prior_rates: pd.DataFrame,
     rate_cols: dict[str, str],
-    blend_gws: float = _PRIOR_SEASON_BLEND_GWS,
+    blend_gws: float | None = None,
 ) -> pd.DataFrame:
     """Shrink each current-season rate toward the same player's prior-season
     rate, weighted by how many gameweeks the current one is actually built on.
@@ -585,20 +615,34 @@ def _blend_toward_prior(
     whatever those few matches happened to say — and, before §20, literally
     zero. A whole prior season of real per-match rates sat unused two feet away.
 
-    Weighting by sample size is the standard answer and needs no tuning
-    beyond the prior's strength: a player with one match is mostly last
-    season's player, a player with fifteen is mostly this season's. New
-    signings and promoted-club players simply have no prior row and are left
-    on their current-season rate alone.
+    Weighting by sample size is the standard answer: a player with one match
+    is mostly last season's player, a player with fifteen is mostly this
+    season's. New signings and promoted-club players simply have no prior row
+    and are left on their current-season rate alone.
+
+    The prior's STRENGTH does need tuning, and it is not shared across rates
+    -- see ``_PRIOR_SEASON_BLEND_GWS_BY_RATE`` above for the walk-forward
+    calibration. Attacking rates shrink hard (k=20); defensive-action volumes
+    are not shrunk at all (k=0), so for those this function is a no-op.
     """
-    if prior_rates.empty or blend_gws <= 0:
+    if prior_rates.empty:
         return last
     out = last.copy()
     n = played.reindex(out.index).fillna(0.0).astype(float)
-    weight_current = n / (n + blend_gws)
     for src, col in rate_cols.items():
         if src not in prior_rates.columns or col not in out.columns:
             continue
+        # ``blend_gws=None`` means "use the calibrated strength for this rate",
+        # which is the live path. An explicit scalar overrides every rate at
+        # once and is what the calibration harness and its tests pass.
+        k = (
+            _PRIOR_SEASON_BLEND_GWS_BY_RATE.get(src, _PRIOR_SEASON_BLEND_GWS)
+            if blend_gws is None
+            else float(blend_gws)
+        )
+        if k <= 0:
+            continue
+        weight_current = n / (n + k)
         prior = prior_rates[src].reindex(out.index)
         blended = weight_current * out[col] + (1.0 - weight_current) * prior
         # A player absent from the prior season keeps their current rate.
