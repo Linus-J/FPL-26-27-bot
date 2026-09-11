@@ -28,6 +28,10 @@ transfer it simply pays an extra -4. So the free hit still beat no chip, by
 The free-hit week itself is unchanged at 68.45: it is a one-week eleven built
 by ``optimise_squad_joint``, which never sees a transfer allowance.
 
+``projected_gain`` is corrected alongside the wording, because that column is
+what the site renders as the week's number; leaving it optimistic would have
+published a figure the corrected sentence beside it contradicts.
+
 Only the newest GW3 chip row is restated, because only that run was replayed
 and only that run is published -- the export keeps one decision per gameweek.
 The runs it superseded are returned to what they said at the time.
@@ -60,6 +64,14 @@ GAMEWEEK = 3
 # reader sees.
 CORRECTED = "beats no-chip by 11.1 xPts — free hit: 68.45 xPts"
 
+# The margin the run recorded, less the extra -4 the second arm pays. That
+# delta is the entire difference between them -- the continuation makes the
+# same three transfers either way -- so taking it off the recorded figure
+# keeps this number on the same footing as every other gain in the log.
+# Substituting the replay's own total would land 0.005 away and import drift
+# the correction is not about.
+CORRECTED_GAIN = 15.058381098233099 - 4.0
+
 # What the earlier pass did, so it can be undone: the count was reduced and a
 # parenthesised note appended.
 _NOTE = re.compile(r" \(logged as (\d+) FTs: [^)]*\)$")
@@ -75,12 +87,13 @@ def strip_correction_note(reason: str) -> str | None:
     return _COUNT.sub(f"{match.group(1)} FT(s) \\2", restored, count=1)
 
 
-def plan_corrections(db: Session) -> list[tuple[int, str, str]]:
-    """``(row id, details JSON, new reason)`` for every row that needs one.
-    Reads only, so ``--dry-run`` cannot write by accident."""
+def plan_corrections(db: Session) -> list[tuple[int, str, str, float | None]]:
+    """``(row id, details JSON, new reason, new gain)`` for every row that needs
+    one, with the gain ``None`` where only the wording changes. Reads only, so
+    ``--dry-run`` cannot write by accident."""
     rows = db.execute(
         text(
-            "SELECT id, details FROM decision_log "
+            "SELECT id, details, projected_gain FROM decision_log "
             "WHERE decision_type = 'chip' AND gameweek = :gw ORDER BY id"
         ),
         {"gw": GAMEWEEK},
@@ -90,14 +103,18 @@ def plan_corrections(db: Session) -> list[tuple[int, str, str]]:
 
     published_id = rows[-1][0]
     planned = []
-    for row_id, raw in rows:
+    for row_id, raw, gain in rows:
         details = json.loads(raw)
         reason = details.get("reason", "")
-        wanted = CORRECTED if row_id == published_id else strip_correction_note(reason)
-        if wanted is None or wanted == reason:
+        published = row_id == published_id
+        wanted = CORRECTED if published else strip_correction_note(reason)
+        # Only the published run was replayed, so only it can carry the
+        # recomputed gain; the rest keep what they recorded at the time.
+        wanted_gain = CORRECTED_GAIN if published else None
+        if wanted is None or (wanted == reason and wanted_gain in (None, gain)):
             continue
         details["reason"] = wanted
-        planned.append((row_id, json.dumps(details), wanted))
+        planned.append((row_id, json.dumps(details), wanted, wanted_gain))
     return planned
 
 
@@ -105,11 +122,20 @@ def correct_gw3_free_hit(db: Session) -> int:
     """Restate the published GW3 chip reason and un-note the rest. Returns how
     many rows changed, which is 0 on a second run."""
     planned = plan_corrections(db)
-    for row_id, details, reason in planned:
-        db.execute(
-            text("UPDATE decision_log SET details = :details WHERE id = :id"),
-            {"details": details, "id": row_id},
-        )
+    for row_id, details, reason, gain in planned:
+        if gain is None:
+            db.execute(
+                text("UPDATE decision_log SET details = :details WHERE id = :id"),
+                {"details": details, "id": row_id},
+            )
+        else:
+            db.execute(
+                text(
+                    "UPDATE decision_log SET details = :details, projected_gain = :gain "
+                    "WHERE id = :id"
+                ),
+                {"details": details, "gain": gain, "id": row_id},
+            )
         logger.info("row %s -> %s", row_id, reason)
     db.commit()
     return len(planned)
@@ -129,7 +155,7 @@ def main() -> None:
     try:
         if args.dry_run:
             planned = plan_corrections(db)
-            for row_id, _, reason in planned:
+            for row_id, _, reason, _gain in planned:
                 logger.info("row %s -> %s", row_id, reason)
             logger.info("Would change %d row(s)", len(planned))
             return

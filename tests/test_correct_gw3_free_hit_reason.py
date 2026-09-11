@@ -30,6 +30,7 @@ from sqlalchemy.orm import sessionmaker
 from data.models import Base, DecisionLog
 from scripts.correct_gw3_free_hit_reason import (
     CORRECTED,
+    CORRECTED_GAIN,
     correct_gw3_free_hit,
     strip_correction_note,
 )
@@ -55,13 +56,13 @@ def session(tmp_path):
     s.close()
 
 
-def _chip_row(session, gameweek: int, reason: str) -> None:
+def _chip_row(session, gameweek: int, reason: str, gain: float = 15.058381098233099) -> None:
     session.add(
         DecisionLog(
             gameweek=gameweek,
             decision_type="chip",
             details=json.dumps({"chip": "freehit", "reason": reason}),
-            projected_gain=15.1,
+            projected_gain=gain,
         )
     )
     session.commit()
@@ -120,10 +121,11 @@ def test_running_it_twice_changes_nothing(session):
     _chip_row(session, 3, NOTED)
     _chip_row(session, 3, NOTED)
 
+    query = text("SELECT details, projected_gain FROM decision_log ORDER BY id")
     correct_gw3_free_hit(session)
-    first = [r[0] for r in session.execute(text("SELECT details FROM decision_log ORDER BY id"))]
+    first = session.execute(query).fetchall()
     correct_gw3_free_hit(session)
-    second = [r[0] for r in session.execute(text("SELECT details FROM decision_log ORDER BY id"))]
+    second = session.execute(query).fetchall()
 
     assert first == second
 
@@ -140,3 +142,41 @@ def test_it_runs_on_a_log_that_was_never_noted(session):
     )
     assert details["reason"] == CORRECTED
     assert details["chip"] == "freehit"
+
+
+def test_the_recomputed_gain_is_the_recorded_one_less_the_extra_hit():
+    """The replay's two arms make the same three transfers and differ by
+    exactly -4, so the honest correction takes that delta off the figure the
+    run actually recorded rather than substituting the replay's own total --
+    which lands 0.005 away and would import drift the correction is not
+    about."""
+    assert CORRECTED_GAIN == 15.058381098233099 - 4.0
+    assert f"{CORRECTED_GAIN:.1f}" == "11.1", "must agree with the published reason"
+
+
+def test_the_published_row_carries_the_recomputed_gain(session):
+    """The site renders every event in the log as a number, so a corrected
+    reason beside the optimistic 15.06 would publish a figure its own
+    sentence contradicts."""
+    _chip_row(session, 3, ORIGINAL)
+
+    correct_gw3_free_hit(session)
+
+    gain = session.execute(text("SELECT projected_gain FROM decision_log")).fetchone()[0]
+    assert gain == CORRECTED_GAIN
+
+
+def test_a_superseded_row_keeps_the_gain_it_recorded(session):
+    """Only the published run was replayed. The runs it superseded are the
+    audit trail of what was believed at the time."""
+    _chip_row(session, 3, ORIGINAL, gain=15.910439841825735)
+    _chip_row(session, 3, ORIGINAL)
+
+    correct_gw3_free_hit(session)
+
+    gains = [
+        r[0] for r in session.execute(
+            text("SELECT projected_gain FROM decision_log ORDER BY id")
+        )
+    ]
+    assert gains == [15.910439841825735, CORRECTED_GAIN]
