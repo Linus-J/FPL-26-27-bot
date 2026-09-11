@@ -221,3 +221,62 @@ def _enrichment(rows):
         for pid, gw, ipt, ispt, kpg, pm in rows
     ])
 
+
+def test_enrichment_carries_forward_to_an_unplayed_gameweek():
+    import pandas as pd
+
+    from projection.features import add_enrichment_features
+
+    enrichment = _enrichment([(1, 1, 0, 1, 2.0, -0.1), (1, 2, 0, 1, 2.0, 0.4)])
+    frame = pd.DataFrame([{"player_id": 1, "gameweek": 3, "season": "2026-27"}])
+
+    out = add_enrichment_features(frame, enrichment)
+
+    assert out["is_set_piece_taker"].iloc[0] == 1
+    assert out["key_passes_per_game"].iloc[0] == pytest.approx(2.0)
+    assert out["price_momentum"].iloc[0] == pytest.approx(0.4)
+
+
+def test_enrichment_carry_forward_never_reaches_a_later_gameweek():
+    """The fallback is a leak the moment it can see forward. Gameweek 2 must
+    resolve to gameweek 1's row even though gameweek 3's also exists."""
+    import pandas as pd
+
+    from projection.features import add_enrichment_features
+
+    enrichment = _enrichment([(1, 1, 0, 0, 0.5, 0.1), (1, 3, 1, 1, 9.0, 0.9)])
+    frame = pd.DataFrame([{"player_id": 1, "gameweek": 2, "season": "2026-27"}])
+
+    out = add_enrichment_features(frame, enrichment)
+
+    assert out["is_penalty_taker"].iloc[0] == 0
+    assert out["key_passes_per_game"].iloc[0] == pytest.approx(0.5)
+    assert out["price_momentum"].iloc[0] == pytest.approx(0.1)
+
+
+def test_enrichment_defaults_when_the_player_has_no_earlier_row():
+    import pandas as pd
+
+    from projection.features import add_enrichment_features
+
+    enrichment = _enrichment([(1, 1, 1, 1, 9.0, 0.9)])
+    frame = pd.DataFrame([{"player_id": 2, "gameweek": 3, "season": "2026-27"}])
+
+    out = add_enrichment_features(frame, enrichment)
+
+    assert out["is_set_piece_taker"].iloc[0] == 0
+    assert out["key_passes_per_game"].iloc[0] == pytest.approx(0.0)
+
+
+def test_enrichment_carry_forward_does_not_cross_seasons():
+    import pandas as pd
+
+    from projection.features import add_enrichment_features
+
+    enrichment = _enrichment([(1, 30, 1, 1, 9.0, 0.9)])
+    enrichment["season"] = "2025-26"
+    frame = pd.DataFrame([{"player_id": 1, "gameweek": 1, "season": "2026-27"}])
+
+    out = add_enrichment_features(frame, enrichment)
+
+    assert out["is_set_piece_taker"].iloc[0] == 0

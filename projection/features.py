@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
@@ -228,6 +229,78 @@ def load_player_enrichment(season: str | None = None) -> pd.DataFrame:
         db.close()
 
 
+def _merge_asof_within_season(
+    df: pd.DataFrame, enr: pd.DataFrame, available: list[str]
+) -> pd.DataFrame:
+    """Exact (player, gameweek, season) match where one exists, otherwise that
+    player's most recent EARLIER gameweek in the same season.
+
+    Why the fallback exists (2026-09-11). ``load_player_enrichment`` selects
+    ``FROM player_gw_stats``, so it has no row for a gameweek that has not been
+    played yet. The row the minutes model actually serves from is exactly that
+    row -- ``_append_asof_rows`` puts the as-of row at ``last_played + 1`` so
+    the rolling features summarise every completed gameweek. A plain equality
+    merge therefore missed for every served player and the ``fillna(0.0)``
+    below turned the miss into a confident zero.
+
+    Measured on the live 2026-27 database at GW4: all 615 served players had
+    ``is_set_piece_taker = 0`` and ``price_momentum = 0``, where the training
+    rows had 21% set-piece takers and signed, non-zero momentum. Summed served
+    P(60+) was 155.2 against 210.3 realised starters per gameweek, and the
+    league-wide maximum was 0.811 -- the model could not say that ANY player
+    was likely to start. With both blocks carried forward the sum is 218.4 and
+    the maximum 0.972. The model itself was never the problem: scored on
+    historical rows, where the merge hits, it is well calibrated
+    (out-of-sample 2025-26 mean prediction 0.273 against a 0.263 base rate,
+    maximum 0.975).
+
+    The two blocks are not equally exact. The set-piece fields come from
+    ``player_setpiece_roles``, which is keyed per (player, season) -- carrying
+    them forward reads the correct value, and the gameweek in the merge key
+    was spurious for them all along. ``price_momentum``/``transfer_velocity``
+    are genuinely point-in-time, so the carried value is a gameweek stale;
+    last week's transfer momentum is a far better estimate of this week's than
+    zero is, but it is an estimate. Fresher snapshots do exist (the live table
+    is written daily), and reading them as-of the target deadline would be the
+    exact fix -- it is not done here because the carried value already closes
+    the whole measured gap.
+
+    ``direction="backward"`` is what keeps this honest: the fallback can only
+    ever see gameweeks at or before the one being asked about, so it cannot
+    leak an outcome into a backtest. Historical rows have their own exact
+    match and are unaffected; this changes the served row only.
+    """
+    if enr.empty:
+        # merge_asof cannot type-check its keys against an empty frame, and
+        # there is nothing to carry forward anyway. The caller's fillna gives
+        # the same answer a miss on every row would have.
+        return df.merge(enr, on=["player_id", "gameweek", "season"], how="left")
+
+    order_key = "_enrich_order"
+    left = df.copy()
+    left[order_key] = np.arange(len(left))
+    right = enr.copy()
+    # merge_asof is strict about key dtypes on both the ``on`` and ``by``
+    # columns, and the two frames reach here from different readers.
+    for frame in (left, right):
+        frame["gameweek"] = frame["gameweek"].astype("int64")
+        frame["player_id"] = frame["player_id"].astype("int64")
+        frame["season"] = frame["season"].astype(str)
+    merged = pd.merge_asof(
+        left.sort_values("gameweek"),
+        right.sort_values("gameweek"),
+        on="gameweek",
+        by=["player_id", "season"],
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    return (
+        merged.sort_values(order_key)
+        .drop(columns=order_key)
+        .reset_index(drop=True)
+    )
+
+
 def add_enrichment_features(df: pd.DataFrame, enrichment: pd.DataFrame) -> pd.DataFrame:
     dynamic = [
         "is_penalty_taker", "penalty_xg_per_game", "is_set_piece_taker",
@@ -238,7 +311,7 @@ def add_enrichment_features(df: pd.DataFrame, enrichment: pd.DataFrame) -> pd.Da
     if all(k in enrichment.columns for k in keys) and {"gameweek", "season"}.issubset(df.columns):
         available = [c for c in dynamic if c in enrichment.columns]
         enr = enrichment[keys + available].drop_duplicates(subset=keys)
-        merged = df.merge(enr, on=keys, how="left")
+        merged = _merge_asof_within_season(df, enr, available)
     else:
         # Fallback (single-row predict without gameweek/season): take each
         # player's latest enrichment row and broadcast on player_id.
