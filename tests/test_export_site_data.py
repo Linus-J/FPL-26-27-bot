@@ -24,6 +24,10 @@ def test_run_wires_payload_write_index_and_commit_in_order(monkeypatch, tmp_path
     )
     monkeypatch.setattr(cli, "write_run_file", fake_write_run_file)
     monkeypatch.setattr(
+        cli, "refresh_from_db",
+        lambda data_dir, db: (calls.append(("refresh",)), [])[1],
+    )
+    monkeypatch.setattr(
         cli, "update_index",
         lambda out_dir, gw, label, generated_at: (
             calls.append(("index", gw)), tmp_path / "index.json"
@@ -37,7 +41,11 @@ def test_run_wires_payload_write_index_and_commit_in_order(monkeypatch, tmp_path
 
     cli.run(no_push=True)
 
-    assert calls == [("build", 99999), ("write", 3), ("index", 3), ("commit", False)]
+    # The refresh reads the same session as the payload, so it has to happen
+    # before that session is closed -- and therefore before the write.
+    assert calls == [
+        ("build", 99999), ("refresh",), ("write", 3), ("index", 3), ("commit", False),
+    ]
 
 
 # --- jsDelivr purge after publishing (2026-08-30) ------------------------
@@ -58,6 +66,7 @@ def _wire(monkeypatch, tmp_path, calls, *, committed=True):
 
     monkeypatch.setattr(cli, "get_session", lambda: MagicMock())
     monkeypatch.setattr(cli, "build_run_payload", lambda db, team_id: fake_payload)
+    monkeypatch.setattr(cli, "refresh_from_db", lambda data_dir, db: [])
     monkeypatch.setattr(cli, "write_run_file", fake_write_run_file)
     monkeypatch.setattr(
         cli, "update_index",

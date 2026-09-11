@@ -17,6 +17,7 @@ from data.db import get_session
 from scripts.site_export.cdn import purge as purge_cdn
 from scripts.site_export.git_sync import commit_and_push
 from scripts.site_export.payload import build_run_payload
+from scripts.site_export.refresh import refresh_from_db
 from scripts.site_export.writer import update_index, write_run_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -40,8 +41,16 @@ def run(*, no_push: bool) -> None:
     db = get_session()
     try:
         payload = build_run_payload(db, settings.fpl_team_id)
+        # A run file is written once and never revisited, which is right for
+        # the squad and projections in it -- they are that week's record. Its
+        # history is not: it renders decision_log, so a correction to a logged
+        # decision would otherwise reach this week's file and no earlier one.
+        refreshed = refresh_from_db(DATA_DIR, db)
     finally:
         db.close()
+
+    for path in refreshed:
+        logger.info("Refreshed history in %s", path.name)
 
     gw = payload["gameweek"]
     run_path = write_run_file(DATA_DIR, gw, payload)
